@@ -32,11 +32,42 @@ services:
     networks:
       - mailmind-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  # Streamlit Frontend
+  mailmind-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: mailmind-frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE_URL=http://mailmind:8000
+      - FRONTEND_PORT=8501
+      - DEBUG_MODE=${DEBUG_MODE:-false}
+      - USER_ID=${USER_ID:-demo_user}
+      - CACHE_TTL=300
+      - ENABLE_CACHING=true
+      - MAX_GRAPH_NODES=50
+      - DEFAULT_SEARCH_LIMIT=10
+      - SEARCH_TIMEOUT=30
+      - SYNC_REFRESH_INTERVAL=5
+      - AUTO_REFRESH_SYNC=true
+    volumes:
+      - ./frontend:/app
+    depends_on:
+      mailmind:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - mailmind-network
+    profiles:
+      - frontend
 
   # PostgreSQL Database
   db:
@@ -56,7 +87,7 @@ services:
     networks:
       - mailmind-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mailmind -d mailmind"]
+      test: [ "CMD-SHELL", "pg_isready -U mailmind -d mailmind" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -81,7 +112,7 @@ services:
     networks:
       - mailmind-network
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:6333/health || exit 1"]
+      test: [ "CMD-SHELL", "curl -f http://localhost:6333/health || exit 1" ]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -101,7 +132,7 @@ services:
     networks:
       - mailmind-network
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 3

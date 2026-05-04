@@ -27,6 +27,7 @@ from core.action_extractor import ActionItemExtractor
 from core.relationship_mapper import RelationshipMapper
 from core.embedding_pipeline import EmbeddingPipeline, ExtractedTask, ExtractedEntity
 from core.vector_store import VectorStore
+from core.draft_reply_agent import DraftReplyAgent, ThreadContext, UserWritingStyle, ReplyType
 
 # Database and vector store imports (to be implemented)
 # from database import get_db, engine
@@ -138,6 +139,9 @@ async def initialize_components():
         
         # Initialize intelligence pipeline
         state.embedding_pipeline = EmbeddingPipeline(openai_api_key)
+        
+        # Initialize draft reply agent
+        state.draft_reply_agent = DraftReplyAgent(AsyncOpenAI(api_key=openai_api_key))
         
         # Initialize vector store (will be initialized on demand)
         state.vector_store = None
@@ -648,6 +652,87 @@ def _extract_entity_values(query: str) -> List[str]:
     return projects + invoices + jira_tickets
 
 
+@app.post("/draft-reply")
+async def generate_draft_reply(
+    thread_id: str,
+    user_id: str = Depends(get_current_user),
+    reply_type: Optional[str] = None,
+    custom_instructions: Optional[str] = None
+):
+    """Generate a professional email reply draft."""
+    try:
+        # Initialize draft reply agent if not available
+        if not hasattr(state, 'draft_reply_agent') or not state.draft_reply_agent:
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            if not openai_api_key:
+                raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+            
+            state.draft_reply_agent = DraftReplyAgent(AsyncOpenAI(api_key=openai_api_key))
+        
+        # Get thread data (mock for now, would come from database)
+        thread_data = await _get_thread_data_for_reply(thread_id, user_id)
+        
+        if not thread_data:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        
+        # Create thread context
+        context = ThreadContext(
+            thread_id=thread_id,
+            subject=thread_data["subject"],
+            participants=thread_data["participant_emails"],
+            messages=thread_data["messages"],
+            action_items=thread_data.get("action_items", []),
+            entities=thread_data.get("entities", []),
+            last_message_sender=thread_data["last_message_sender"],
+            last_message_content=thread_data["last_message_content"],
+            user_writing_style=thread_data.get("user_writing_style")
+        )
+        
+        # Convert reply type string to enum
+        reply_type_enum = None
+        if reply_type:
+            try:
+                reply_type_enum = ReplyType(reply_type)
+            except ValueError:
+                logger.warning(f"Invalid reply type: {reply_type}")
+        
+        # Generate the reply
+        logger.info(f"Generating draft reply for thread {thread_id}")
+        generated_reply = await state.draft_reply_agent.generate_reply(
+            context=context,
+            reply_type=reply_type_enum,
+            custom_instructions=custom_instructions
+        )
+        
+        return {
+            "thread_id": thread_id,
+            "reply": {
+                "subject": generated_reply.subject,
+                "greeting": generated_reply.greeting,
+                "body": generated_reply.body,
+                "closing": generated_reply.closing,
+                "signature": generated_reply.signature,
+                "full_email": f"{generated_reply.greeting}\n\n{generated_reply.body}\n\n{generated_reply.closing}\n{generated_reply.signature or ''}",
+                "action_items_addressed": generated_reply.action_items_addressed,
+                "entities_referenced": generated_reply.entities_referenced,
+                "confidence_score": generated_reply.confidence_score,
+                "tone": generated_reply.tone.value,
+                "estimated_reading_time": generated_reply.estimated_reading_time,
+                "word_count": generated_reply.word_count
+            },
+            "metadata": {
+                "thread_subject": thread_data["subject"],
+                "last_message_sender": thread_data["last_message_sender"],
+                "thread_participants": thread_data["participant_emails"],
+                "generated_at": datetime.utcnow().isoformat()
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Draft reply generation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/threads/{thread_id}", response_model=ThreadResponse)
 async def get_thread(thread_id: str, user_id: str = Depends(get_current_user)):
     """Get detailed thread information."""
@@ -661,11 +746,37 @@ async def get_thread(thread_id: str, user_id: str = Depends(get_current_user)):
             "subject": "Project Update - Q1 Planning",
             "message_count": 5,
             "participant_emails": ["alice@example.com", "bob@example.com"],
-            "first_message_date": datetime.utcnow() - timedelta(days=5),
-            "last_message_date": datetime.utcnow() - timedelta(days=1),
-            "aggregated_content": "Full thread content would be here...",
-            "detected_tasks": ["Complete Q1 budget proposal", "Schedule team meeting"],
-            "related_threads": ["thread_456", "thread_789"]
+            "first_message_date": "2024-01-15T10:30:00Z",
+            "last_message_date": "2024-01-15T14:30:00Z",
+            "has_attachments": True,
+            "detected_tasks": ["Complete quarterly report", "Schedule team meeting"],
+            "aggregated_content": "Discussion about Q1 planning and resource allocation...",
+            "messages": [
+                {
+                    "message_id": "msg_1",
+                    "from_email": "alice@example.com",
+                    "to_emails": ["bob@example.com"],
+                    "subject": "Project Update - Q1 Planning",
+                    "body_text": "Let's discuss our Q1 planning...",
+                    "gmail_date": "2024-01-15T10:30:00Z"
+                }
+            ],
+            "action_items": [
+                {
+                    "task_text": "Complete quarterly report",
+                    "priority": "high",
+                    "assignee": "bob@example.com",
+                    "due_date": "2024-01-20",
+                    "status": "pending"
+                }
+            ],
+            "entities": [
+                {
+                    "entity_type": "project",
+                    "entity_value": "Q1-Planning",
+                    "confidence_score": 0.9
+                }
+            ]
         }
         
         return ThreadResponse(**thread_data)
@@ -675,29 +786,170 @@ async def get_thread(thread_id: str, user_id: str = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Management endpoints
-@app.get("/sync/status/{sync_id}")
-async def get_sync_status(sync_id: str, user_id: str = Depends(get_current_user)):
-    """Get status of a sync operation."""
+async def _get_thread_data_for_reply(thread_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    """Get thread data formatted for reply generation."""
     try:
-        # Get sync status from database (to be implemented)
-        # sync_status = await get_sync_status_from_db(sync_id, user_id)
+        # Mock thread data - in production, this would come from database
+        thread_data = {
+            "thread_id": thread_id,
+            "subject": "Project Update - Q1 Planning",
+            "participant_emails": ["alice@example.com", "bob@example.com", user_id],
+            "messages": [
+                {
+                    "message_id": "msg_1",
+                    "from_email": "alice@example.com",
+                    "to_emails": ["bob@example.com", user_id],
+                    "body_text": "Hi team, I wanted to follow up on our Q1 planning. Can we schedule a meeting to discuss resource allocation?",
+                    "gmail_date": "2024-01-15T10:30:00Z"
+                },
+                {
+                    "message_id": "msg_2",
+                    "from_email": "bob@example.com",
+                    "to_emails": ["alice@example.com", user_id],
+                    "body_text": "I'm available Tuesday afternoon. Also, we need to complete the quarterly report by end of month.",
+                    "gmail_date": "2024-01-15T11:15:00Z"
+                }
+            ],
+            "action_items": [
+                {
+                    "task_text": "Schedule Q1 planning meeting",
+                    "priority": "high",
+                    "assignee": user_id,
+                    "due_date": "2024-01-20",
+                    "status": "pending"
+                },
+                {
+                    "task_text": "Complete quarterly report",
+                    "priority": "high",
+                    "assignee": "bob@example.com",
+                    "due_date": "2024-01-31",
+                    "status": "pending"
+                }
+            ],
+            "entities": [
+                {
+                    "entity_type": "project",
+                    "entity_value": "Q1-Planning",
+                    "confidence_score": 0.9
+                },
+                {
+                    "entity_type": "meeting",
+                    "entity_value": "Q1 Planning Meeting",
+                    "confidence_score": 0.8
+                }
+            ],
+            "last_message_sender": "bob@example.com",
+            "last_message_content": "I'm available Tuesday afternoon. Also, we need to complete the quarterly report by end of month.",
+            "user_writing_style": UserWritingStyle(
+                tone=ReplyTone.PROFESSIONAL,
+                formality_level=0.7,
+                average_sentence_length=15.0,
+                greeting_style="Hi",
+                closing_style="Best regards",
+                signature_included=True,
+                use_emojis=False,
+                use_bullets=True,
+                response_length_preference="medium"
+            )
+        }
         
-        # Mock status for demo
+        return thread_data
+        
+    except Exception as e:
+        logger.error(f"Failed to get thread data for reply: {str(e)}")
+        return None
+
+
+@app.get("/tasks")
+async def get_top_tasks(
+    user_id: str = Depends(get_current_user),
+    limit: int = 5,
+    priority_filter: Optional[str] = None
+):
+    """Get top action items across all threads for the user."""
+    try:
+        # Initialize vector store if not available
+        if not hasattr(state, 'vector_store') or not state.vector_store:
+            qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+            qdrant_api_key = os.getenv("QDRANT_API_KEY")
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            
+            if not openai_api_key:
+                raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+            
+            state.vector_store = VectorStore(qdrant_url, qdrant_api_key or "", openai_api_key)
+            await state.vector_store.initialize_collection()
+        
+        # Search for threads with action items
+        results = await state.vector_store.client.search(
+            collection_name="mailmind_threads",
+            query_filter={
+                "must": [
+                    {"key": "user_id", "match": {"value": user_id}},
+                    {"key": "intelligence_metadata.has_tasks", "match": {"value": True}}
+                ]
+            },
+            limit=limit * 3,  # Get more to filter and sort
+            with_payload=True
+        )
+        
+        # Extract and sort action items
+        all_tasks = []
+        for hit in results:
+            payload = hit.payload
+            action_items = payload.get("action_items", [])
+            
+            for task in action_items:
+                # Apply priority filter if specified
+                if priority_filter and task.get("priority", "").lower() != priority_filter.lower():
+                    continue
+                
+                task_data = {
+                    "task_id": f"{payload['thread_id']}_{task.get('source_message_id', 'unknown')}",
+                    "thread_id": payload["thread_id"],
+                    "subject": payload["subject"],
+                    "task_text": task.get("task_text", ""),
+                    "priority": task.get("priority", "medium"),
+                    "assignee": task.get("assignee", "Unassigned"),
+                    "due_date": task.get("due_date"),
+                    "status": task.get("status", "pending"),
+                    "confidence_score": task.get("confidence_score", 0.8),
+                    "context": task.get("context", ""),
+                    "thread_date": payload["last_message_date"]
+                }
+                all_tasks.append(task_data)
+        
+        # Sort tasks by priority and due date
+        priority_order = {"urgent": 4, "high": 3, "medium": 2, "low": 1}
+        
+        def task_sort_key(task):
+            priority_score = priority_order.get(task.get("priority", "medium"), 2)
+            
+            # Boost score for overdue tasks
+            due_date = task.get("due_date")
+            if due_date:
+                try:
+                    due_dt = datetime.fromisoformat(due_date.replace('Z', '+00:00'))
+                    if due_dt < datetime.utcnow():
+                        priority_score += 10  # Overdue tasks get highest priority
+                except:
+                    pass
+            
+            return (-priority_score, -task.get("confidence_score", 0))
+        
+        all_tasks.sort(key=task_sort_key)
+        
+        # Return top tasks
+        top_tasks = all_tasks[:limit]
+        
         return {
-            "sync_id": sync_id,
-            "status": "completed",
-            "progress": 100,
-            "threads_processed": 25,
-            "messages_processed": 87,
-            "attachments_processed": 12,
-            "started_at": datetime.utcnow() - timedelta(minutes=10),
-            "completed_at": datetime.utcnow() - timedelta(minutes=2),
-            "errors": []
+            "tasks": top_tasks,
+            "total_found": len(all_tasks),
+            "limit": limit
         }
         
     except Exception as e:
-        logger.error(f"Get sync status error: {str(e)}")
+        logger.error(f"Get tasks error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
