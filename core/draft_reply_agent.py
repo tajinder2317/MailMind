@@ -17,7 +17,7 @@ from enum import Enum
 import json
 import re
 
-from openai import AsyncOpenAI
+from core.groq_client import get_async_groq_client
 
 logger = logging.getLogger(__name__)
 
@@ -237,18 +237,24 @@ class DraftReplyAgent:
     """
     Intelligent email reply generation agent.
     
-    Uses GPT-4o-mini to generate professional responses that:
+    Uses Groq to generate professional responses that:
     - Address action items and questions
     - Reference relevant entities
     - Match user's writing style
     - Provide contextually appropriate responses
     """
     
-    def __init__(self, openai_client: AsyncOpenAI):
+    def __init__(self, openai_client: AsyncOpenAI = None):
         """Initialize the draft reply agent."""
-        self.client = openai_client
-        self.model = "gpt-4o-mini"
+        self.groq_client = None  # Will be initialized when needed
+        self.model = os.getenv("DRAFT_REPLY_MODEL", "llama3-70b-8192")
         self.style_analyzer = StyleAnalyzer()
+    
+    async def _get_client(self):
+        """Get Groq client instance."""
+        if self.groq_client is None:
+            self.groq_client = await get_async_groq_client()
+        return self.groq_client
     
     async def generate_reply(
         self,
@@ -282,9 +288,9 @@ class DraftReplyAgent:
                 context, reply_type, thread_analysis, custom_instructions
             )
             
-            # Generate the reply
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            # Get Groq client and generate the reply
+            client = await self._get_client()
+            response = await client.chat_completion(
                 messages=[
                     {
                         "role": "system",

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 from urllib.parse import urlparse
 
-from openai import AsyncOpenAI
+from core.groq_client import get_async_groq_client
 
 logger = logging.getLogger(__name__)
 
@@ -266,19 +266,18 @@ class ReferenceDetector:
 
 
 class RelationshipMapper:
-    """
-    Maps relationships between threads based on shared references.
-    """
+    """Maps relationships between email threads using AI analysis."""
     
-    def __init__(self, openai_api_key: str):
-        """
-        Initialize relationship mapper.
-        
-        Args:
-            openai_api_key: OpenAI API key for semantic analysis
-        """
-        self.client = AsyncOpenAI(api_key=openai_api_key)
-        self.reference_detector = ReferenceDetector()
+    def __init__(self, openai_api_key: str = None):
+        """Initialize the relationship mapper."""
+        self.groq_client = None  # Will be initialized when needed
+        self.model = os.getenv("RELATIONSHIP_MODEL", "llama3-70b-8192")
+    
+    async def _get_client(self):
+        """Get Groq client instance."""
+        if self.groq_client is None:
+            self.groq_client = await get_async_groq_client()
+        return self.groq_client
     
     async def map_thread_relationships(
         self,

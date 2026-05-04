@@ -12,7 +12,7 @@ from datetime import datetime
 import tiktoken
 import json
 
-from openai import AsyncOpenAI
+from core.groq_client import get_async_groq_client
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -54,20 +54,7 @@ class SlidingContextProcessor:
     MIN_MESSAGES_FOR_SUMMARY = 4  # Only summarize if we have at least this many messages
     
     # OpenAI model settings
-    SUMMARY_MODEL = "gpt-4o-mini"
-    MAX_RETRIES = 3
-    RETRY_DELAY = 1.0
     
-    def __init__(self, openai_api_key: str):
-        """
-        Initialize sliding context processor.
-        
-        Args:
-            openai_api_key: OpenAI API key for GPT-4o-mini access
-        """
-        self.client = AsyncOpenAI(api_key=openai_api_key)
-        self.tokenizer = tiktoken.encoding_for_model("gpt-4")
-        
     async def process_thread_content(
         self,
         messages: List[Dict[str, Any]],
@@ -217,60 +204,63 @@ class SlidingContextProcessor:
             'covered_messages': covered_message_ids + [msg.message_id for msg in latest_messages]
         }
     
-    async def _generate_summary(self, messages: List[MessageContent]) -> str:
-        """
-        Generate a summary of the given messages using GPT-4o-mini.
-        
-        Args:
-            messages: Messages to summarize
+    async def _generate_summary(
+        self,
+        messages: List[MessageContent],
+        context: str = ""
+    ) -> str:
+        """Generate a summary of the given messages using Groq."""
+        try:
+            # Get Groq client
+            client = await self._get_client()
             
-        Returns:
-            Generated summary text
-        """
-        messages_text = "\n\n".join(self._format_message(msg) for msg in messages)
-        
-        prompt = f"""
-Please summarize the following email thread conversation. Focus on:
-1. Key topics discussed
-2. Important decisions made
-3. Action items or next steps
-4. Any deadlines or dates mentioned
-5. Main participants and their roles
+            # Build the prompt
+            messages_text = "\n\n".join([
+                f"From: {msg.from_email}\nDate: {msg.gmail_date}\n{msg.body_text}"
+                for msg in messages
+            ])
+            
+            prompt = f"""
+You are an expert email thread summarizer. Create a concise summary of the following email messages.
 
-Keep the summary concise but comprehensive, around {self.SUMMARY_TARGET_TOKENS} tokens.
+Context: {context}
 
-Email Thread:
+Messages to summarize:
 {messages_text}
 
-Summary:"""
-        
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                response = await self.client.chat.completions.create(
-                    model=self.SUMMARY_MODEL,
-                    messages=[
-                        {"role": "system", "content": "You are an expert at summarizing email conversations accurately and concisely."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=1000,
-                    temperature=0.3
-                )
-                
-                summary = response.choices[0].message.content.strip()
-                
-                # Add metadata to summary
-                metadata = f"\n\n[SUMMARY_METADATA: messages={len(messages)}, date_range={messages[0].gmail_date.strftime('%Y-%m-%d')} to {messages[-1].gmail_date.strftime('%Y-%m-%d')}]"
-                
-                return summary + metadata
-                
-            except Exception as e:
-                logger.warning(f"Summary generation attempt {attempt + 1} failed: {str(e)}")
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(self.RETRY_DELAY * (2 ** attempt))
-                else:
-                    raise
-        
-        raise Exception("Failed to generate summary after all retries")
+Requirements:
+1. Create a clear, concise summary (max {self.SUMMARY_TARGET_TOKENS} tokens)
+2. Focus on key decisions, action items, and important information
+3. Maintain chronological flow
+4. Include participant names and their roles
+5. Highlight any deadlines or commitments
+6. Preserve critical context for future messages
+
+Summary:
+"""
+            
+            response = await client.chat_completion(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert email thread summarizer. Create clear, concise summaries that capture all essential information."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                max_tokens=self.SUMMARY_TARGET_TOKENS,
+                temperature=0.3
+            )
+            
+            summary = response.choices[0].message.content.strip()
+            logger.info(f"Generated summary: {len(summary)} characters")
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Failed to generate summary: {str(e)}")
+            return f"Summary generation failed: {str(e)}"
     
     async def _extend_summary(self, existing_summary: str, new_messages: List[MessageContent]) -> str:
         """

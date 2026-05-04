@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 import re
 import json
 
-from openai import AsyncOpenAI
+from core.groq_client import get_async_groq_client
 from dataclasses import dataclass
 from enum import Enum
 
@@ -94,21 +94,14 @@ class ActionItemExtractor:
     }
     
     # OpenAI settings
-    ANALYSIS_MODEL = "gpt-4o-mini"
-    MAX_RETRIES = 3
-    RETRY_DELAY = 1.0
     
-    def __init__(self, openai_api_key: str):
-        """
-        Initialize action item extractor.
-        
-        Args:
-            openai_api_key: OpenAI API key for LLM analysis
-        """
-        self.client = AsyncOpenAI(api_key=openai_api_key)
-        self._compile_patterns()
+    async def _get_client(self):
+        """Get Groq client instance."""
+        if self.groq_client is None:
+            self.groq_client = await get_async_groq_client()
+        return self.groq_client
     
-    def _compile_patterns(self):
+    async def _compile_patterns(self):
         """Pre-compile regex patterns for better performance."""
         self.compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.TASK_PATTERNS]
     
@@ -252,103 +245,93 @@ class ActionItemExtractor:
             List of ActionItem objects
         """
         try:
-            # Prepare prompt for LLM
-            participants_str = ", ".join(participants)
+            # Get Groq client
+            client = await self._get_client()
+            
+            # Build context from messages
+            message_context = self._build_message_context(messages)
             
             prompt = f"""
-Analyze the following email thread and extract all action items, tasks, commitments, and follow-up items.
+You are an expert action item extractor. Analyze the following email thread content and extract all action items, tasks, commitments, and deadlines.
 
-Participants: {participants_str}
+Thread Participants: {', '.join(participants)}
 
-For each action item, provide:
-1. The specific task or commitment
-2. Priority level (low/medium/high/urgent)
-3. Who is assigned (if mentioned)
-4. Due date (if mentioned)
-5. Confidence score (0.0-1.0)
-6. Context from the email
+Message Context:
+{message_context}
 
-Email Thread:
-{thread_content[:8000]}  # Limit to prevent token overflow
+Content to Analyze:
+{content}
 
-Respond in JSON format:
-{{
-    "action_items": [
-        {{
-            "task_text": "Complete the quarterly report",
-            "priority": "high",
-            "assignee": "john@example.com",
-            "due_date": "2024-01-15",
-            "confidence_score": 0.9,
-            "context": "John needs to complete the quarterly report by Friday for the board meeting"
-        }}
-    ]
-}}"""
+Extract ALL action items and return them as a JSON array with the following structure:
+[
+    {{
+        "task_text": "Complete the quarterly report",
+        "priority": "high",
+        "assignee": "john@example.com",
+        "due_date": "2024-01-31",
+        "status": "pending",
+        "confidence_score": 0.9,
+        "source_message_id": "msg_123",
+        "context": "Mentioned in the meeting notes"
+    }}
+]
+
+Requirements:
+1. Extract ALL action items, tasks, and commitments
+2. Include both explicit and implied tasks
+3. Identify assignees from participants or use "Unassigned"
+4. Extract due dates or infer from context
+5. Assign priority based on urgency indicators
+6. Include confidence scores (0.1-1.0)
+7. Provide brief context for each task
+8. Return valid JSON array only
+
+Action Items:
+"""
             
-            for attempt in range(self.MAX_RETRIES):
-                try:
-                    response = await self.client.chat.completions.create(
-                        model=self.ANALYSIS_MODEL,
-                        messages=[
-                            {"role": "system", "content": "You are an expert at identifying action items and tasks in email conversations. Always respond in valid JSON format."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        max_tokens=2000,
-                        temperature=0.1
-                    )
-                    
-                    content = response.choices[0].message.content.strip()
-                    
-                    # Parse JSON response
-                    try:
-                        data = json.loads(content)
-                        llm_items = []
-                        
-                        for item_data in data.get('action_items', []):
-                            # Parse due date
-                            due_date = None
-                            if item_data.get('due_date'):
-                                try:
-                                    due_date = datetime.fromisoformat(item_data['due_date'].replace('Z', '+00:00'))
-                                except:
-                                    due_date = self._parse_relative_date(item_data['due_date'])
-                            
-                            # Find source message
-                            source_message_id = self._find_message_for_task(item_data['task_text'], messages)
-                            
-                            # Extract context
-                            context = item_data.get('context', item_data['task_text'])
-                            
-                            # Extract keywords
-                            keywords = self._extract_keywords(item_data['task_text'])
-                            
-                            item = ActionItem(
-                                task_text=item_data['task_text'],
-                                priority=TaskPriority(item_data.get('priority', 'medium')),
-                                assignee=item_data.get('assignee'),
-                                due_date=due_date,
-                                context=context,
-                                confidence_score=float(item_data.get('confidence_score', 0.7)),
-                                source_message_id=source_message_id,
-                                keywords=keywords
-                            )
-                            
-                            llm_items.append(item)
-                        
-                        return llm_items
-                        
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse LLM JSON response: {str(e)}")
-                        continue
-                        
-                except Exception as e:
-                    logger.warning(f"LLM extraction attempt {attempt + 1} failed: {str(e)}")
-                    if attempt < self.MAX_RETRIES - 1:
-                        await asyncio.sleep(self.RETRY_DELAY * (2 ** attempt))
-                    else:
-                        raise
+            response = await client.chat_completion(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert action item extractor. Extract all tasks, commitments, and action items from email content. Return valid JSON only."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                max_tokens=1500,
+                temperature=0.1
+            )
             
-            return []
+            content = response.choices[0].message.content.strip()
+            
+            # Clean up the response
+            if content.startswith("```json"):
+                content = content[7:-3].strip()
+            elif content.startswith("```"):
+                content = content[3:-3].strip()
+            
+            # Parse JSON
+            try:
+                action_items = json.loads(content)
+                if not isinstance(action_items, list):
+                    action_items = []
+                
+                # Validate and enhance action items
+                validated_items = []
+                for item in action_items:
+                    validated_item = self._validate_action_item(item, participants)
+                    if validated_item:
+                        validated_items.append(validated_item)
+                
+                logger.info(f"Extracted {len(validated_items)} action items via LLM")
+                return validated_items
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse LLM response as JSON: {str(e)}")
+                logger.error(f"Raw content: {content}")
+                return []
             
         except Exception as e:
             logger.error(f"LLM extraction failed: {str(e)}")

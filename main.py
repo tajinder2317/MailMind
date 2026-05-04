@@ -140,8 +140,8 @@ async def initialize_components():
         # Initialize intelligence pipeline
         state.embedding_pipeline = EmbeddingPipeline(openai_api_key)
         
-        # Initialize draft reply agent
-        state.draft_reply_agent = DraftReplyAgent(AsyncOpenAI(api_key=openai_api_key))
+        # Initialize draft reply agent (uses Groq)
+        state.draft_reply_agent = DraftReplyAgent()
         
         # Initialize vector store (will be initialized on demand)
         state.vector_store = None
