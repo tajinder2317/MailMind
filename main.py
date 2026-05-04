@@ -25,6 +25,8 @@ from core.attachment_processor import AttachmentProcessor, AttachmentProcessorWo
 from core.sliding_context import SlidingContextProcessor
 from core.action_extractor import ActionItemExtractor
 from core.relationship_mapper import RelationshipMapper
+from core.embedding_pipeline import EmbeddingPipeline, ExtractedTask, ExtractedEntity
+from core.vector_store import VectorStore
 
 # Database and vector store imports (to be implemented)
 # from database import get_db, engine
@@ -133,6 +135,12 @@ async def initialize_components():
         state.sliding_context = SlidingContextProcessor(openai_api_key)
         state.action_extractor = ActionItemExtractor(openai_api_key)
         state.relationship_mapper = RelationshipMapper(openai_api_key)
+        
+        # Initialize intelligence pipeline
+        state.embedding_pipeline = EmbeddingPipeline(openai_api_key)
+        
+        # Initialize vector store (will be initialized on demand)
+        state.vector_store = None
         
         logger.info("All components initialized successfully")
         
@@ -369,24 +377,33 @@ async def process_thread(gmail_thread, user_id: str) -> Dict[str, int]:
 # Search endpoints
 @app.post("/search", response_model=SearchResponse)
 async def search_threads(request: SearchRequest, user_id: str = Depends(get_current_user)):
-    """Search threads using semantic similarity."""
+    """Search threads using intelligent semantic similarity with self-correction."""
     try:
         start_time = datetime.utcnow()
         
-        # Perform semantic search (to be implemented with Qdrant)
-        # results = await vector_store.search(request.query, user_id, request.limit, request.filters)
+        # Initialize vector store if not available
+        if not hasattr(state, 'vector_store') or not state.vector_store:
+            qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+            qdrant_api_key = os.getenv("QDRANT_API_KEY")
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            
+            if not openai_api_key:
+                raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+            
+            state.vector_store = VectorStore(qdrant_url, qdrant_api_key or "", openai_api_key)
+            await state.vector_store.initialize_collection()
         
-        # Mock results for demo
-        results = [
-            {
-                "thread_id": "thread_123",
-                "subject": "Project Update - Q1 Planning",
-                "score": 0.95,
-                "snippet": "Discussion about Q1 planning and resource allocation...",
-                "participants": ["alice@example.com", "bob@example.com"],
-                "date": "2024-01-15T10:30:00Z"
-            }
-        ]
+        # Detect query intent for self-correction
+        query_intent = await _detect_query_intent(request.query)
+        logger.info(f"Detected query intent: {query_intent}")
+        
+        # Perform intelligent search based on intent
+        if query_intent == "tasks":
+            results = await _search_tasks(request, user_id, query_intent)
+        elif query_intent == "entities":
+            results = await _search_entities(request, user_id, query_intent)
+        else:
+            results = await _search_semantic(request, user_id)
         
         search_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
         
@@ -399,6 +416,236 @@ async def search_threads(request: SearchRequest, user_id: str = Depends(get_curr
     except Exception as e:
         logger.error(f"Search error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _detect_query_intent(query: str) -> str:
+    """Detect the intent of the user's query for self-correction."""
+    query_lower = query.lower()
+    
+    # Task-related queries
+    task_keywords = [
+        "task", "tasks", "action", "actions", "item", "items",
+        "todo", "to-do", "deadline", "due", "assign", "assigned",
+        "complete", "finish", "pending", "overdue", "reminder"
+    ]
+    
+    # Entity-related queries
+    entity_keywords = [
+        "project", "projects", "invoice", "invoices", "jira", "ticket",
+        "tickets", "meeting", "meetings", "document", "documents"
+    ]
+    
+    # Check for task intent
+    if any(keyword in query_lower for keyword in task_keywords):
+        return "tasks"
+    
+    # Check for entity intent
+    if any(keyword in query_lower for keyword in entity_keywords):
+        return "entities"
+    
+    # Default to semantic search
+    return "semantic"
+
+
+async def _search_tasks(request: SearchRequest, user_id: str, intent: str) -> List[Dict[str, Any]]:
+    """Search for threads with action items, prioritizing task metadata."""
+    try:
+        # First, search for threads with action items using metadata filtering
+        results = await state.vector_store.client.search(
+            collection_name="mailmind_threads",
+            query_filter={
+                "must": [
+                    {"key": "user_id", "match": {"value": user_id}},
+                    {"key": "intelligence_metadata.has_tasks", "match": {"value": True}}
+                ]
+            },
+            limit=request.limit,
+            with_payload=True
+        )
+        
+        # Convert to response format
+        formatted_results = []
+        for hit in results:
+            payload = hit.payload
+            action_items = payload.get("action_items", [])
+            
+            # Filter action items based on query
+            relevant_tasks = []
+            for task in action_items:
+                task_text = task.get("task_text", "").lower()
+                if any(word in task_text for word in request.query.lower().split()):
+                    relevant_tasks.append(task)
+            
+            if relevant_tasks or not any(word in request.query.lower().split() for word in ["what", "show", "list"]):
+                formatted_results.append({
+                    "thread_id": payload["thread_id"],
+                    "subject": payload["subject"],
+                    "score": hit.score,
+                    "snippet": _extract_task_snippet(relevant_tasks or action_items),
+                    "participants": payload["participant_emails"],
+                    "date": payload["last_message_date"],
+                    "action_items": relevant_tasks or action_items[:3],  # Show relevant or first 3 tasks
+                    "total_tasks": len(action_items),
+                    "search_type": "task_search"
+                })
+        
+        # If no results from task search, fallback to semantic search
+        if not formatted_results:
+            return await _search_semantic(request, user_id)
+        
+        return formatted_results
+        
+    except Exception as e:
+        logger.error(f"Task search failed: {str(e)}")
+        return await _search_semantic(request, user_id)
+
+
+async def _search_entities(request: SearchRequest, user_id: str, intent: str) -> List[Dict[str, Any]]:
+    """Search for threads with specific entities."""
+    try:
+        # Extract potential entity values from query
+        entity_values = _extract_entity_values(request.query)
+        
+        if entity_values:
+            # Search for threads containing these entities
+            results = await state.vector_store.client.search(
+                collection_name="mailmind_threads",
+                query_filter={
+                    "must": [
+                        {"key": "user_id", "match": {"value": user_id}},
+                        {"key": "entities.entity_value", "match": {"any": entity_values}}
+                    ]
+                },
+                limit=request.limit,
+                with_payload=True
+            )
+        else:
+            # Search for threads with any entities
+            results = await state.vector_store.client.search(
+                collection_name="mailmind_threads",
+                query_filter={
+                    "must": [
+                        {"key": "user_id", "match": {"value": user_id}},
+                        {"key": "intelligence_metadata.has_entities", "match": {"value": True}}
+                    ]
+                },
+                limit=request.limit,
+                with_payload=True
+            )
+        
+        # Convert to response format
+        formatted_results = []
+        for hit in results:
+            payload = hit.payload
+            entities = payload.get("entities", [])
+            
+            # Filter entities based on query
+            relevant_entities = []
+            for entity in entities:
+                entity_value = entity.get("entity_value", "").lower()
+                entity_type = entity.get("entity_type", "").lower()
+                
+                if (entity_value in request.query.lower() or 
+                    entity_type in request.query.lower()):
+                    relevant_entities.append(entity)
+            
+            formatted_results.append({
+                "thread_id": payload["thread_id"],
+                "subject": payload["subject"],
+                "score": hit.score,
+                "snippet": _extract_entity_snippet(relevant_entities or entities),
+                "participants": payload["participant_emails"],
+                "date": payload["last_message_date"],
+                "entities": relevant_entities or entities[:5],  # Show relevant or first 5 entities
+                "total_entities": len(entities),
+                "search_type": "entity_search"
+            })
+        
+        return formatted_results
+        
+    except Exception as e:
+        logger.error(f"Entity search failed: {str(e)}")
+        return await _search_semantic(request, user_id)
+
+
+async def _search_semantic(request: SearchRequest, user_id: str) -> List[Dict[str, Any]]:
+    """Perform standard semantic search."""
+    try:
+        # Generate query embedding
+        query_embedding = await state.vector_store.embed_thread(request.query)
+        
+        # Search in Qdrant
+        search_results = await state.vector_store.search_similar_threads(
+            query=request.query,
+            user_id=user_id,
+            limit=request.limit,
+            filters=request.filters,
+            score_threshold=0.7
+        )
+        
+        # Convert to response format
+        formatted_results = []
+        for result in search_results:
+            formatted_results.append({
+                "thread_id": result["thread_id"],
+                "subject": result["subject"],
+                "score": result["score"],
+                "snippet": result.get("snippet", ""),
+                "participants": result["participant_emails"],
+                "date": result["last_message_date"],
+                "action_items": result.get("detected_tasks", []),
+                "entities": result.get("referenced_projects", []),
+                "search_type": "semantic_search"
+            })
+        
+        return formatted_results
+        
+    except Exception as e:
+        logger.error(f"Semantic search failed: {str(e)}")
+        return []
+
+
+def _extract_task_snippet(tasks: List[Dict[str, Any]]) -> str:
+    """Extract a snippet from task list."""
+    if not tasks:
+        return "No tasks found"
+    
+    task_texts = [task.get("task_text", "") for task in tasks[:3]]
+    return f"Tasks: {'; '.join(task_texts)}"
+
+
+def _extract_entity_snippet(entities: List[Dict[str, Any]]) -> str:
+    """Extract a snippet from entity list."""
+    if not entities:
+        return "No entities found"
+    
+    entity_texts = []
+    for entity in entities[:5]:
+        entity_type = entity.get("entity_type", "")
+        entity_value = entity.get("entity_value", "")
+        entity_texts.append(f"{entity_type}: {entity_value}")
+    
+    return f"Entities: {'; '.join(entity_texts)}"
+
+
+def _extract_entity_values(query: str) -> List[str]:
+    """Extract potential entity values from query."""
+    # Simple extraction for common patterns
+    import re
+    
+    # Project codes (PROJ-123)
+    project_pattern = r'\b[A-Z]{2,}-\d{3,}\b'
+    projects = re.findall(project_pattern, query.upper())
+    
+    # Invoice numbers
+    invoice_pattern = r'\b(invoice|inv|receipt|po)\s*#?\s*\d{4,}\b'
+    invoices = re.findall(invoice_pattern, query, re.IGNORECASE)
+    
+    # JIRA tickets
+    jira_pattern = r'\b[A-Z]+-\d{3,}\b'
+    jira_tickets = re.findall(jira_pattern, query.upper())
+    
+    return projects + invoices + jira_tickets
 
 
 @app.get("/threads/{thread_id}", response_model=ThreadResponse)

@@ -67,13 +67,15 @@ class Thread(Base):
     has_summary = Column(Boolean, default=False)
     running_summary = Column(Text)
     
-    # Action items extracted from thread
-    detected_tasks = Column(JSON, default=list)  # List of task strings
+    # Action items extracted from thread (enhanced structure)
+    detected_tasks = Column(JSON, default=list)  # Legacy field for compatibility
+    action_items = Column(JSON, default=list)  # Structured action items with full metadata
     
-    # Cross-thread relationships
+    # Cross-thread relationships and entities
     referenced_projects = Column(JSON, default=list)  # List of project codes
     referenced_urls = Column(JSON, default=list)  # List of URLs
     referenced_invoices = Column(JSON, default=list)  # List of invoice numbers
+    extracted_entities = Column(JSON, default=list)  # Structured entities with metadata
     
     # Vector metadata
     vector_id = Column(String(255), nullable=True, unique=True)  # Qdrant vector ID
