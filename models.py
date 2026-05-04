@@ -28,11 +28,18 @@ class SyncState(Base):
     user_id = Column(String(255), nullable=False, index=True)
     last_synced_at = Column(DateTime(timezone=True), nullable=False)
     last_message_id = Column(String(255), nullable=False)
+    last_history_id = Column(String(255), nullable=True, index=True)  # Gmail history ID for incremental sync
+    sync_status = Column(String(50), default="completed")  # in_progress, completed, failed
+    sync_type = Column(String(50), default="incremental")  # incremental, full, backfill
+    threads_processed = Column(Integer, default=0)
+    messages_processed = Column(Integer, default=0)
+    errors = Column(JSON, default=list)  # List of error messages
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
     updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
     
     __table_args__ = (
         Index("idx_sync_user_updated", "user_id", "updated_at"),
+        Index("idx_sync_history_id", "last_history_id"),
     )
 
 
@@ -43,11 +50,13 @@ class Thread(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     gmail_thread_id = Column(String(255), nullable=False, unique=True, index=True)
     user_id = Column(String(255), nullable=False, index=True)
+    gmail_history_id = Column(String(255), nullable=True, index=True)  # Gmail history ID for thread
     subject = Column(Text, nullable=False)
     participant_emails = Column(JSON, nullable=False)  # List of email addresses
     message_count = Column(Integer, default=0)
     first_message_date = Column(DateTime(timezone=True), nullable=False)
     last_message_date = Column(DateTime(timezone=True), nullable=False)
+    sync_priority = Column(String(20), default="normal")  # high, normal, low
     
     # Aggregated content for embedding
     aggregated_content = Column(Text, nullable=False)
@@ -81,6 +90,8 @@ class Thread(Base):
     __table_args__ = (
         Index("idx_thread_user_date", "user_id", "last_message_date"),
         Index("idx_thread_content_hash", "content_hash"),
+        Index("idx_thread_priority", "sync_priority"),
+        Index("idx_thread_history_id", "gmail_history_id"),
     )
 
 

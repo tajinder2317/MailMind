@@ -8,15 +8,20 @@ messages, and attachments with proper authentication and rate limiting.
 import asyncio
 import base64
 import email
+import json
+import os
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, AsyncGenerator, Tuple
+from typing import List, Dict, Optional, AsyncGenerator, Tuple, Set
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.message import Message
+from pathlib import Path
+from urllib.parse import urlencode
+import webbrowser
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import InstalledAppFlow, Flow
 from googleapiclient.discovery import build, Resource
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
@@ -24,8 +29,17 @@ from googleapiclient.http import MediaIoBaseDownload
 import aiohttp
 import logging
 from dataclasses import dataclass
+from enum import Enum
+import heapq
 
 logger = logging.getLogger(__name__)
+
+
+class SyncPriority(Enum):
+    """Sync priority levels for threads."""
+    HIGH = "high"      # Last 24 hours
+    NORMAL = "normal"   # Last 7 days
+    LOW = "low"        # Historical (older than 7 days)
 
 
 @dataclass
@@ -42,6 +56,7 @@ class GmailMessage:
     body_html: Optional[str]
     gmail_date: datetime
     internal_date: int
+    history_id: Optional[str]
     attachments: List[Dict[str, any]]
 
 
@@ -52,18 +67,21 @@ class GmailThread:
     subject: str
     messages: List[GmailMessage]
     participant_emails: List[str]
+    history_id: Optional[str]
+    sync_priority: SyncPriority
 
 
 class GmailClient:
     """
-    Gmail API client with OAuth2 authentication and thread fetching capabilities.
+    Gmail API client with OAuth2 authentication and incremental sync capabilities.
     
     Features:
     - OAuth2 authentication with token refresh
     - Rate limiting and retry logic
     - Thread-centric message fetching
     - Attachment handling
-    - Incremental sync support
+    - Incremental sync using History API
+    - Priority-based sync queue
     """
     
     SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
@@ -78,47 +96,129 @@ class GmailClient:
             credentials_path: Path to OAuth2 credentials JSON file
             token_path: Path to store/refresh OAuth2 tokens
         """
-        self.credentials_path = credentials_path
-        self.token_path = token_path
+        self.credentials_path = Path(credentials_path)
+        self.token_path = Path(token_path)
         self.service: Optional[Resource] = None
         self._credentials: Optional[Credentials] = None
+        self._flow: Optional[Flow] = None
+        self._auth_code: Optional[str] = None
         
+    async def initiate_oauth_flow(self, redirect_uri: str = "http://localhost:8080/callback") -> str:
+        """
+        Initiate OAuth2 flow and return authorization URL.
+        
+        Args:
+            redirect_uri: Callback URL for OAuth2
+            
+        Returns:
+            Authorization URL for user to visit
+        """
+        try:
+            # Create OAuth2 flow
+            self._flow = InstalledAppFlow.from_client_secrets_file(
+                str(self.credentials_path), 
+                self.SCOPES,
+                redirect_uri=redirect_uri
+            )
+            
+            # Generate authorization URL
+            auth_url, state = self._flow.authorization_url(
+                access_type='offline',
+                include_granted_scopes='true',
+                prompt='consent'
+            )
+            
+            logger.info(f"OAuth2 flow initiated, state: {state}")
+            return auth_url
+            
+        except Exception as e:
+            logger.error(f"Failed to initiate OAuth2 flow: {str(e)}")
+            raise
+    
+    async def complete_oauth_flow(self, auth_code: str, state: str) -> bool:
+        """
+        Complete OAuth2 flow with authorization code.
+        
+        Args:
+            auth_code: Authorization code from OAuth2 callback
+            state: State parameter from OAuth2 flow
+            
+        Returns:
+            True if authentication successful, False otherwise
+        """
+        try:
+            if not self._flow:
+                raise ValueError("OAuth2 flow not initiated")
+            
+            # Exchange auth code for credentials
+            self._flow.fetch_token(code=auth_code)
+            
+            # Get credentials
+            self._credentials = self._flow.credentials
+            
+            # Save credentials
+            await self._save_credentials()
+            
+            # Build service
+            self.service = build('gmail', 'v1', credentials=self._credentials)
+            
+            logger.info("OAuth2 authentication completed successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to complete OAuth2 flow: {str(e)}")
+            return False
+    
     async def authenticate(self) -> bool:
         """
         Authenticate with Gmail API using OAuth2.
+        Supports both existing tokens and new OAuth2 flow.
         
         Returns:
             True if authentication successful, False otherwise
         """
         try:
-            creds = None
-            
             # Load existing tokens
             if self.token_path.exists():
                 creds = Credentials.from_authorized_user_file(str(self.token_path), self.SCOPES)
-            
-            # If no valid credentials, get new ones
-            if not creds or not creds.valid:
-                if creds and creds.expired and creds.refresh_token:
-                    creds.refresh(Request())
-                else:
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        str(self.credentials_path), self.SCOPES
-                    )
-                    creds = flow.run_local_server(port=0)
                 
-                # Save credentials
-                with open(self.token_path, 'w') as token:
-                    token.write(creds.to_json())
+                if creds and creds.valid:
+                    self._credentials = creds
+                    self.service = build('gmail', 'v1', credentials=creds)
+                    logger.info("Gmail authentication successful (existing tokens)")
+                    return True
+                elif creds and creds.expired and creds.refresh_token:
+                    try:
+                        creds.refresh(Request())
+                        self._credentials = creds
+                        await self._save_credentials()
+                        self.service = build('gmail', 'v1', credentials=creds)
+                        logger.info("Gmail authentication successful (token refreshed)")
+                        return True
+                    except Exception as e:
+                        logger.warning(f"Token refresh failed: {str(e)}")
             
-            self._credentials = creds
-            self.service = build('gmail', 'v1', credentials=creds)
-            logger.info("Gmail authentication successful")
-            return True
+            # No valid credentials, need OAuth2 flow
+            logger.info("No valid credentials found, OAuth2 flow required")
+            return False
             
         except Exception as e:
             logger.error(f"Gmail authentication failed: {str(e)}")
             return False
+    
+    async def _save_credentials(self):
+        """Save credentials to token file."""
+        try:
+            # Ensure directory exists
+            self.token_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Save credentials
+            with open(self.token_path, 'w') as token:
+                token.write(self._credentials.to_json())
+                
+        except Exception as e:
+            logger.error(f"Failed to save credentials: {str(e)}")
+            raise
     
     async def get_user_profile(self) -> Dict[str, any]:
         """
@@ -222,11 +322,16 @@ class GmailClient:
             # Sort messages chronologically
             messages.sort(key=lambda x: x.gmail_date)
             
+            # Get thread history ID from the thread data
+            thread_history_id = result.get('historyId')
+            
             return GmailThread(
                 thread_id=thread_id,
                 subject=messages[0].subject if messages else "",
                 messages=messages,
-                participant_emails=list(participant_emails)
+                participant_emails=list(participant_emails),
+                history_id=thread_history_id,
+                sync_priority=SyncPriority.NORMAL  # Will be updated by sync queue
             )
             
         except HttpError as e:
@@ -261,6 +366,9 @@ class GmailClient:
         gmail_date = datetime.fromtimestamp(int(msg_data.get('internalDate', 0)) / 1000)
         internal_date = int(msg_data.get('internalDate', 0))
         
+        # Extract history ID
+        history_id = msg_data.get('historyId')
+        
         return GmailMessage(
             message_id=msg_data['id'],
             thread_id=msg_data['threadId'],
@@ -273,6 +381,7 @@ class GmailClient:
             body_html=body_html,
             gmail_date=gmail_date,
             internal_date=internal_date,
+            history_id=history_id,
             attachments=attachments
         )
     
@@ -434,6 +543,187 @@ class GmailClient:
                 addresses.append(addr)
         
         return addresses
+    
+    async def get_thread_updates(
+        self,
+        user_id: str,
+        last_history_id: Optional[str] = None,
+        last_sync_time: Optional[datetime] = None,
+        max_results: int = 50
+    ) -> AsyncGenerator[GmailThread, None]:
+        """
+        Get thread updates using Gmail History API or timestamp queries.
+        
+        Args:
+            user_id: User ID for filtering
+            last_history_id: Last history ID from previous sync
+            last_sync_time: Last sync timestamp as fallback
+            max_results: Maximum results to return
+            
+        Yields:
+            GmailThread objects with updates
+        """
+        if not self.service:
+            raise ValueError("Service not initialized. Call authenticate() first.")
+        
+        try:
+            # Try History API first if we have a history ID
+            if last_history_id:
+                logger.info(f"Using History API with last_history_id: {last_history_id}")
+                async for thread in self._get_history_updates(last_history_id, max_results):
+                    yield thread
+            else:
+                # Fallback to timestamp-based query
+                sync_time = last_sync_time or (datetime.utcnow() - timedelta(days=1))
+                logger.info(f"Using timestamp-based query since: {sync_time}")
+                async for thread in self.get_threads_since(sync_time, max_results):
+                    yield thread
+                    
+        except Exception as e:
+            logger.error(f"Failed to get thread updates: {str(e)}")
+            raise
+    
+    async def _get_history_updates(
+        self,
+        start_history_id: str,
+        max_results: int = 50
+    ) -> AsyncGenerator[GmailThread, None]:
+        """
+        Get thread updates using Gmail History API.
+        
+        Args:
+            start_history_id: Starting history ID
+            max_results: Maximum results to return
+            
+        Yields:
+            GmailThread objects with updates
+        """
+        try:
+            history_list = self.service.users().history()
+            
+            # Get history records
+            history_result = history_list.list(
+                userId='me',
+                startHistoryId=start_history_id,
+                historyTypes=['messageAdded', 'labelAdded', 'labelRemoved'],
+                maxResults=max_results
+            ).execute()
+            
+            histories = history_result.get('history', [])
+            
+            if not histories:
+                logger.info("No new history records found")
+                return
+            
+            # Extract thread IDs from history
+            thread_ids = set()
+            for history in histories:
+                for record in history.get('messagesAdded', []):
+                    message = record.get('message', {})
+                    thread_id = message.get('threadId')
+                    if thread_id:
+                        thread_ids.add(thread_id)
+            
+            # Fetch full thread details
+            for thread_id in thread_ids:
+                try:
+                    thread = await self.get_thread(thread_id)
+                    if thread:
+                        yield thread
+                except HttpError as e:
+                    if e.resp.status == 404:
+                        logger.warning(f"Thread {thread_id} not found (may have been deleted)")
+                    else:
+                        raise
+                        
+        except HttpError as e:
+            if e.resp.status == 404:
+                logger.warning(f"History ID {start_history_id} not found, falling back to timestamp query")
+                # Fallback to timestamp-based query
+                fallback_time = datetime.utcnow() - timedelta(days=1)
+                async for thread in self.get_threads_since(fallback_time, max_results):
+                    yield thread
+            else:
+                raise
+    
+    async def create_sync_queue(
+        self,
+        user_id: str,
+        last_sync_time: Optional[datetime] = None
+    ) -> List[Tuple[SyncPriority, GmailThread]]:
+        """
+        Create priority-based sync queue for threads.
+        
+        Args:
+            user_id: User ID for filtering
+            last_sync_time: Last sync time for determining priority
+            
+        Returns:
+            List of (priority, thread) tuples sorted by priority
+        """
+        if not self.service:
+            raise ValueError("Service not initialized. Call authenticate() first.")
+        
+        try:
+            sync_queue = []
+            now = datetime.utcnow()
+            
+            # Define time windows for different priorities
+            high_priority_cutoff = now - timedelta(hours=24)
+            normal_priority_cutoff = now - timedelta(days=7)
+            
+            # Get all threads since last sync (or last 30 days if no sync time)
+            since_time = last_sync_time or (now - timedelta(days=30))
+            
+            logger.info(f"Creating sync queue since: {since_time}")
+            
+            async for thread in self.get_threads_since(since_time):
+                # Determine priority based on thread age
+                if thread.messages and thread.last_message_date:
+                    last_msg_time = thread.last_message_date
+                    
+                    if last_msg_time >= high_priority_cutoff:
+                        priority = SyncPriority.HIGH
+                    elif last_msg_time >= normal_priority_cutoff:
+                        priority = SyncPriority.NORMAL
+                    else:
+                        priority = SyncPriority.LOW
+                    
+                    thread.sync_priority = priority
+                    sync_queue.append((priority, thread))
+            
+            # Sort by priority (HIGH -> NORMAL -> LOW)
+            priority_order = {SyncPriority.HIGH: 0, SyncPriority.NORMAL: 1, SyncPriority.LOW: 2}
+            sync_queue.sort(key=lambda x: priority_order[x[0]])
+            
+            logger.info(f"Created sync queue with {len(sync_queue)} threads")
+            logger.info(f"High priority: {sum(1 for p, _ in sync_queue if p == SyncPriority.HIGH)}")
+            logger.info(f"Normal priority: {sum(1 for p, _ in sync_queue if p == SyncPriority.NORMAL)}")
+            logger.info(f"Low priority: {sum(1 for p, _ in sync_queue if p == SyncPriority.LOW)}")
+            
+            return sync_queue
+            
+        except Exception as e:
+            logger.error(f"Failed to create sync queue: {str(e)}")
+            raise
+    
+    async def get_current_history_id(self) -> Optional[str]:
+        """
+        Get the current history ID for the user's mailbox.
+        
+        Returns:
+            Current history ID or None if not available
+        """
+        try:
+            if not self.service:
+                raise ValueError("Service not initialized. Call authenticate() first.")
+            
+            profile = self.service.users().getProfile(userId='me').execute()
+            return profile.get('historyId')
+            
+        except Exception as e:
+            logger.error(f"Failed to get current history ID: {str(e)}")
+            return None
     
     async def test_connection(self) -> bool:
         """
