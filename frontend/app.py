@@ -231,6 +231,12 @@ def render_header():
 
 def render_sidebar():
     """Render sidebar with navigation and actions."""
+    # Ensure session state is initialized
+    if 'sync_in_progress' not in st.session_state:
+        st.session_state.sync_in_progress = False
+    if 'sync_id' not in st.session_state:
+        st.session_state.sync_id = None
+    
     with st.sidebar:
         st.header("🔧 Configuration")
         

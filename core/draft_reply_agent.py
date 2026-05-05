@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum
 import json
 import re
+import os
 
 from core.groq_client import get_async_groq_client
 
@@ -244,10 +245,10 @@ class DraftReplyAgent:
     - Provide contextually appropriate responses
     """
     
-    def __init__(self, openai_client: AsyncOpenAI = None):
+    def __init__(self):
         """Initialize the draft reply agent."""
         self.groq_client = None  # Will be initialized when needed
-        self.model = os.getenv("DRAFT_REPLY_MODEL", "llama3-70b-8192")
+        self.model = os.getenv("DRAFT_REPLY_MODEL", "llama-3.1-8b-instant")
         self.style_analyzer = StyleAnalyzer()
     
     async def _get_client(self):

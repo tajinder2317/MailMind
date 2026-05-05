@@ -216,7 +216,7 @@ class ProcessingLog(Base):
     # Status and details
     status = Column(String(50), nullable=False)  # started, completed, failed
     message = Column(Text, nullable=True)
-    metadata = Column(JSON, nullable=True)  # Additional event-specific data
+    event_metadata = Column(JSON, nullable=True)  # Additional event-specific data
     
     # Timestamps
     duration_ms = Column(Integer, nullable=True)  # Processing duration in milliseconds

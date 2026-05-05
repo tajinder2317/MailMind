@@ -11,7 +11,7 @@ asyncpg==0.29.0
 alembic==1.13.0
 
 # Vector Database
-qdrant-client==1.7.0
+qdrant-client==1.7.1
 
 # Gmail API
 google-api-python-client==2.108.0
@@ -19,7 +19,7 @@ google-auth-httplib2==0.1.1
 google-auth-oauthlib==1.1.0
 
 # AI/ML
-openai==1.3.7
+openai>=1.12.0
 tiktoken==0.5.2
 
 # Document Processing
@@ -28,7 +28,7 @@ pdfplumber==0.10.3
 python-docx==1.1.0
 
 # Image OCR
-Pillow==10.1.0
+Pillow==10.4.0
 pytesseract==0.3.10
 
 # Async Support
