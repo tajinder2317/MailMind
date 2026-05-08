@@ -7,6 +7,7 @@ for long threads using GPT-4o-mini to keep content within token limits.
 
 import asyncio
 import logging
+import os
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import tiktoken
@@ -52,8 +53,21 @@ class SlidingContextProcessor:
     MAX_CONTEXT_TOKENS = 4000
     SUMMARY_TARGET_TOKENS = 800
     MIN_MESSAGES_FOR_SUMMARY = 4  # Only summarize if we have at least this many messages
+
+    # Retry settings for summary generation/extension
+    MAX_RETRIES = 3
+    RETRY_DELAY = 1  # seconds
     
     # OpenAI model settings
+
+    def __init__(self, tokenizer_model: str = "gpt-4o-mini"):
+        # Tokenizer used only for rough token counting.
+        try:
+            self.tokenizer = tiktoken.encoding_for_model(tokenizer_model)
+        except Exception:
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+
+        self.groq_client = None
     
     async def process_thread_content(
         self,
@@ -80,6 +94,7 @@ class SlidingContextProcessor:
                 - covered_messages: List[str]
         """
         try:
+            enable_summary = os.getenv("ENABLE_SLIDING_CONTEXT_SUMMARY", "true").strip().lower() in {"1", "true", "yes", "y"}
             # Convert messages to MessageContent objects
             message_contents = []
             for msg in messages:
@@ -100,6 +115,16 @@ class SlidingContextProcessor:
             
             logger.info(f"Processing thread with {len(messages)} messages, {total_tokens} tokens")
             
+            if not enable_summary:
+                content = self._concatenate_messages(message_contents)
+                return {
+                    'processed_content': content,
+                    'has_summary': False,
+                    'running_summary': None,
+                    'token_count': total_tokens,
+                    'covered_messages': [msg.message_id for msg in message_contents],
+                }
+
             # If within token limit, return as-is
             if total_tokens <= self.MAX_CONTEXT_TOKENS:
                 content = self._concatenate_messages(message_contents)
@@ -203,7 +228,7 @@ class SlidingContextProcessor:
             'token_count': final_token_count,
             'covered_messages': covered_message_ids + [msg.message_id for msg in latest_messages]
         }
-    
+
     async def _generate_summary(
         self,
         messages: List[MessageContent],
@@ -250,6 +275,7 @@ Summary:
                         "content": prompt
                     }
                 ],
+                model=os.getenv("SUMMARY_MODEL", os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")),
                 max_tokens=self.SUMMARY_TARGET_TOKENS,
                 temperature=0.3
             )
@@ -292,27 +318,28 @@ Instructions:
 
 Updated Summary:"""
         
+        client = await self._get_client()
+
         for attempt in range(self.MAX_RETRIES):
             try:
-                response = await self.client.chat.completions.create(
-                    model=self.SUMMARY_MODEL,
+                response = await client.chat_completion(
                     messages=[
-                        {"role": "system", "content": "You are an expert at updating email thread summaries while maintaining accuracy and conciseness."},
-                        {"role": "user", "content": prompt}
+                        {
+                            "role": "system",
+                            "content": "You update email thread summaries while maintaining accuracy and conciseness."
+                        },
+                        {"role": "user", "content": prompt},
                     ],
                     max_tokens=1200,
-                    temperature=0.3
+                    temperature=0.3,
                 )
-                
                 return response.choices[0].message.content.strip()
-                
             except Exception as e:
                 logger.warning(f"Summary extension attempt {attempt + 1} failed: {str(e)}")
                 if attempt < self.MAX_RETRIES - 1:
                     await asyncio.sleep(self.RETRY_DELAY * (2 ** attempt))
-                else:
-                    # Fallback: append new messages to existing summary
-                    return f"{existing_summary}\n\n[NEW_MESSAGES]\n{new_messages_text}"
+                # Fallback: append new messages to existing summary
+                return f"{existing_summary}\n\n[NEW_MESSAGES]\n{new_messages_text}"
         
         raise Exception("Failed to extend summary after all retries")
     

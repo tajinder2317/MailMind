@@ -19,13 +19,14 @@ networkx==3.2.1
 
 # Additional UI Components
 streamlit-extras==0.3.0
-streamlit-elements==0.1.3
+# 0.1.3 is not available for some platforms (e.g., linux/aarch64); 0.1.0 is widely published.
+streamlit-elements==0.1.0
 
 # Date and Time Handling
 python-dateutil==2.8.2
 
 # Caching
-streamlit-caching==0.1.1
+# (Removed) streamlit-caching is not published for many platforms and isn't used by this app.
 
 # Configuration
 python-dotenv==1.0.0

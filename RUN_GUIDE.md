@@ -88,7 +88,7 @@ Create `.env` file in root directory:
 ```bash
 # Groq Configuration (High-speed LLM)
 GROQ_API_KEY=your_groq_api_key_here
-LLM_MODEL=llama3-70b-8192
+LLM_MODEL=llama-3.3-70b-versatile
 
 # Database Configuration
 DATABASE_URL=postgresql+asyncpg://mailmind:your_password@localhost:5432/mailmind
@@ -102,7 +102,7 @@ QDRANT_API_KEY=your_qdrant_api_key
 LOG_LEVEL=INFO
 MAX_WORKERS=10
 DEBUG_MODE=false
-USER_ID=demo_user
+USER_ID=soorma2317@gmail.com
 
 # Frontend Configuration (for frontend/.env)
 API_BASE_URL=http://localhost:8000

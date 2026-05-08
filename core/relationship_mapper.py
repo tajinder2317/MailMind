@@ -272,7 +272,8 @@ class RelationshipMapper:
     def __init__(self, openai_api_key: str = None):
         """Initialize the relationship mapper."""
         self.groq_client = None  # Will be initialized when needed
-        self.model = os.getenv("RELATIONSHIP_MODEL", "llama3-70b-8192")
+        self.model = os.getenv("RELATIONSHIP_MODEL", "llama-3.3-70b-versatile")
+        self.reference_detector = ReferenceDetector()
     
     async def _get_client(self):
         """Get Groq client instance."""

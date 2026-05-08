@@ -7,6 +7,7 @@ using natural language processing and LLM analysis.
 
 import asyncio
 import logging
+import os
 from typing import List, Dict, Any, Optional, Set
 from datetime import datetime, timedelta
 import re
@@ -94,6 +95,83 @@ class ActionItemExtractor:
     }
     
     # OpenAI settings
+
+    def __init__(self):
+        self.groq_client = None
+        self.compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.TASK_PATTERNS]
+
+    def _build_message_context(self, messages: List[Dict[str, Any]], max_messages: int = 10) -> str:
+        """Build a compact message context block for LLM prompts."""
+        if not messages:
+            return ""
+
+        # Keep only the most recent messages for brevity.
+        msgs = messages[-max_messages:]
+        parts: List[str] = []
+        for msg in msgs:
+            from_email = msg.get("from_email", "")
+            date = msg.get("gmail_date")
+            date_str = date.isoformat() if hasattr(date, "isoformat") else str(date or "")
+            body = (msg.get("body_text") or "").strip()
+            body = body[:1000] + ("..." if len(body) > 1000 else "")
+            parts.append(f"- {date_str} {from_email}: {body}")
+
+        return "\n".join(parts)
+
+    def _validate_action_item(self, item: Dict[str, Any], participants: List[str]) -> Optional[ActionItem]:
+        """Validate and normalize an LLM-extracted action item."""
+        try:
+            task_text = (item.get("task_text") or "").strip()
+            if not task_text or len(task_text) < 5:
+                return None
+
+            priority_raw = (item.get("priority") or "medium").strip().lower()
+            if priority_raw not in {"low", "medium", "high", "urgent"}:
+                priority_raw = "medium"
+            priority = TaskPriority(priority_raw)
+
+            assignee = item.get("assignee")
+            if isinstance(assignee, str):
+                assignee = assignee.strip()
+                if assignee.lower() in {"unassigned", "none", ""}:
+                    assignee = None
+            else:
+                assignee = None
+
+            due_date = None
+            due_raw = item.get("due_date")
+            if isinstance(due_raw, str) and due_raw.strip():
+                due_date = self._extract_due_date(due_raw.strip()) or self._parse_date_string(due_raw.strip())
+
+            context = (item.get("context") or "").strip()
+            confidence = float(item.get("confidence_score", 0.7) or 0.7)
+            confidence = max(0.1, min(1.0, confidence))
+
+            source_message_id = str(item.get("source_message_id") or "")
+            keywords = item.get("keywords") or self._extract_keywords(task_text)
+            if not isinstance(keywords, list):
+                keywords = self._extract_keywords(task_text)
+
+            return ActionItem(
+                task_text=task_text,
+                priority=priority,
+                assignee=assignee,
+                due_date=due_date,
+                context=context,
+                confidence_score=confidence,
+                source_message_id=source_message_id,
+                keywords=keywords,
+            )
+        except Exception:
+            return None
+
+    def _parse_date_string(self, date_str: str) -> Optional[datetime]:
+        """Best-effort parse of a date string into a datetime."""
+        try:
+            # ISO or ISO-like
+            return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        except Exception:
+            return None
     
     async def _get_client(self):
         """Get Groq client instance."""
@@ -102,8 +180,9 @@ class ActionItemExtractor:
         return self.groq_client
     
     async def _compile_patterns(self):
-        """Pre-compile regex patterns for better performance."""
-        self.compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.TASK_PATTERNS]
+        """Backward-compatible no-op (patterns compiled in __init__)."""
+        if not hasattr(self, "compiled_patterns") or not self.compiled_patterns:
+            self.compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.TASK_PATTERNS]
     
     async def extract_action_items(
         self,
@@ -128,8 +207,11 @@ class ActionItemExtractor:
             # Step 1: Pattern-based extraction
             pattern_items = await self._extract_with_patterns(thread_content, messages)
             
-            # Step 2: LLM-based semantic extraction
-            llm_items = await self._extract_with_llm(thread_content, messages, participants)
+            # Step 2: LLM-based semantic extraction (optional; can be disabled to avoid Groq rate limits)
+            enable_llm = os.getenv("ENABLE_LLM_ACTION_EXTRACTION", "true").strip().lower() in {"1", "true", "yes", "y"}
+            llm_items = []
+            if enable_llm:
+                llm_items = await self._extract_with_llm(thread_content, messages, participants)
             
             # Step 3: Merge and deduplicate results
             merged_items = await self._merge_action_items(pattern_items, llm_items)
@@ -249,7 +331,10 @@ class ActionItemExtractor:
             client = await self._get_client()
             
             # Build context from messages
-            message_context = self._build_message_context(messages)
+            message_context = self._build_message_context(messages, max_messages=5)
+            safe_thread_content = (thread_content or "").strip()
+            if len(safe_thread_content) > 3500:
+                safe_thread_content = safe_thread_content[:3500] + "..."
             
             prompt = f"""
 You are an expert action item extractor. Analyze the following email thread content and extract all action items, tasks, commitments, and deadlines.
@@ -260,7 +345,7 @@ Message Context:
 {message_context}
 
 Content to Analyze:
-{content}
+{safe_thread_content}
 
 Extract ALL action items and return them as a JSON array with the following structure:
 [
@@ -300,17 +385,15 @@ Action Items:
                         "content": prompt
                     }
                 ],
+                model=os.getenv("ACTION_MODEL", os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")),
                 max_tokens=1500,
                 temperature=0.1
             )
             
             content = response.choices[0].message.content.strip()
             
-            # Clean up the response
-            if content.startswith("```json"):
-                content = content[7:-3].strip()
-            elif content.startswith("```"):
-                content = content[3:-3].strip()
+            # Extract the first JSON array/object from the response (models often add prose).
+            content = self._extract_first_json_block(content)
             
             # Parse JSON
             try:
@@ -336,6 +419,60 @@ Action Items:
         except Exception as e:
             logger.error(f"LLM extraction failed: {str(e)}")
             return []
+
+    def _extract_first_json_block(self, text: str) -> str:
+        """Extract the first top-level JSON array/object from text."""
+        if not text:
+            return ""
+
+        stripped = text.strip()
+
+        # Fast path: code-fenced JSON
+        if "```" in stripped:
+            parts = stripped.split("```")
+            for part in parts:
+                p = part.strip()
+                if p.startswith("json"):
+                    p = p[4:].strip()
+                if p.startswith("[") or p.startswith("{"):
+                    stripped = p
+                    break
+
+        # Find first '{' or '['
+        start_candidates = [i for i in [stripped.find("["), stripped.find("{")] if i != -1]
+        if not start_candidates:
+            return stripped
+        start = min(start_candidates)
+        s = stripped[start:]
+
+        # Scan to matching closing bracket/brace
+        opening = s[0]
+        closing = "]" if opening == "[" else "}"
+        depth = 0
+        in_string = False
+        escape = False
+        for idx, ch in enumerate(s):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == "\"":
+                    in_string = False
+                continue
+
+            if ch == "\"":
+                in_string = True
+                continue
+
+            if ch == opening:
+                depth += 1
+            elif ch == closing:
+                depth -= 1
+                if depth == 0:
+                    return s[: idx + 1].strip()
+
+        return s.strip()
     
     async def _merge_action_items(
         self,

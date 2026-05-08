@@ -15,7 +15,7 @@ services:
       - QDRANT_API_KEY=${QDRANT_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - GMAIL_CREDENTIALS_PATH=/app/config/credentials.json
-      - GMAIL_TOKEN_PATH=/app/config/token.json
+      - GMAIL_TOKEN_DIR=/app/tokens
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MAX_WORKERS=${MAX_WORKERS:-10}
       - OCR_LANGUAGE=${OCR_LANGUAGE:-eng}
@@ -27,7 +27,7 @@ services:
       db:
         condition: service_healthy
       qdrant:
-        condition: service_healthy
+        condition: service_started
     restart: unless-stopped
     networks:
       - mailmind-network
@@ -81,8 +81,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./config/init.sql:/docker-entrypoint-initdb.d/init.sql
-    ports:
-      - "5432:5432"
+    # No host port binding by default (avoids conflicts with local Postgres).
     restart: unless-stopped
     networks:
       - mailmind-network
@@ -111,12 +110,7 @@ services:
     restart: unless-stopped
     networks:
       - mailmind-network
-    healthcheck:
-      test: [ "CMD-SHELL", "curl -f http://localhost:6333/health || exit 1" ]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
+    # Qdrant image doesn't ship with curl/wget/nc; skip container healthcheck.
 
   # Redis for caching and session management
   redis:

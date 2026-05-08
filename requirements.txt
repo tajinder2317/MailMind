@@ -13,6 +13,10 @@ alembic==1.13.0
 # Vector Database
 qdrant-client==1.7.1
 
+# Local embeddings (free) for Qdrant indexing/search
+# Note: choose a version that supports newer Python (e.g. 3.14).
+fastembed==0.8.0
+
 # Gmail API
 google-api-python-client==2.108.0
 google-auth-httplib2==0.1.1

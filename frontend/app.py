@@ -112,6 +112,16 @@ class MailMindAPI:
         except requests.RequestException as e:
             st.error(f"Gmail auth error: {str(e)}")
             return {}
+
+    def gmail_auth_status(self, user_id: str) -> Dict[str, Any]:
+        """Check Gmail auth status."""
+        try:
+            response = self.session.get(f"{self.base_url}/auth/gmail/status", params={"user_id": user_id})
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            st.error(f"Gmail status error: {str(e)}")
+            return {}
     
     def search_threads(self, query: str, user_id: str, limit: int = 10) -> Dict[str, Any]:
         """Search threads."""
@@ -212,7 +222,7 @@ api = MailMindAPI()
 
 # Session state initialization
 if 'user_id' not in st.session_state:
-    st.session_state.user_id = "demo_user"
+    st.session_state.user_id = "soorma2317@gmail.com"
 if 'current_search' not in st.session_state:
     st.session_state.current_search = ""
 if 'selected_thread' not in st.session_state:
@@ -252,8 +262,21 @@ def render_sidebar():
                 if result.get("status") == "authenticated":
                     st.success(f"✅ Connected as {result.get('user_email')}")
                     st.info(f"Messages: {result.get('messages_total', 0)}")
+                elif result.get("status") == "authorization_required":
+                    st.warning("Authorization required. Open the link below to connect Gmail, then come back and click 'Check Auth Status'.")
+                    auth_url = result.get("auth_url")
+                    if auth_url:
+                        st.markdown(f"[Open Gmail authorization page]({auth_url})")
                 else:
                     st.error("❌ Authentication failed")
+
+        if st.button("Check Auth Status", key="auth_status"):
+            with st.spinner("Checking Gmail authentication..."):
+                status = api.gmail_auth_status(user_id)
+                if status.get("status") == "authenticated":
+                    st.success(f"✅ Connected as {status.get('user_email')}")
+                else:
+                    st.info("Not authenticated yet. Click 'Authenticate Gmail' to start.")
         
         # One-Click Sync
         st.subheader("🔄 Sync")
@@ -869,6 +892,17 @@ def render_thread_detail():
         st.subheader("🎯 Action Items")
         for task in thread_data["detected_tasks"]:
             st.markdown(f"- {task}")
+
+    # Messages
+    messages = thread_data.get("messages", [])
+    if messages:
+        st.subheader("💬 Messages")
+        for msg in messages:
+            from_email = msg.get("from_email", "Unknown")
+            msg_date = msg.get("gmail_date", "")
+            body_text = msg.get("body_text", "") or ""
+            with st.expander(f"{from_email} — {msg_date}", expanded=False):
+                st.text(body_text)
     
     # Related threads
     if thread_data.get("related_threads"):

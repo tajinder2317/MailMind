@@ -12,30 +12,11 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install system dependencies
+# Install minimal system dependencies.
+# Keep this lean to make Docker builds reliable on low-disk environments.
 RUN apt-get update && apt-get install -y \
-    # Build dependencies
-    build-essential \
     curl \
-    git \
-    # OCR dependencies
-    tesseract-ocr \
-    tesseract-ocr-eng \
-    libtesseract-dev \
-    # Image processing dependencies
-    libpng-dev \
-    libjpeg-dev \
-    libtiff-dev \
-    zlib1g-dev \
-    libfreetype6-dev \
-    liblcms2-dev \
-    libwebp-dev \
-    # PDF processing dependencies
-    libpoppler-dev \
-    libpoppler-cpp-dev \
-    # Network utilities
-    wget \
-    # Cleanup
+    netcat-openbsd \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

@@ -11,7 +11,7 @@ import email
 import json
 import os
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, AsyncGenerator, Tuple, Set
+from typing import List, Dict, Optional, AsyncGenerator, Tuple, Set, Any
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.message import Message
@@ -96,12 +96,42 @@ class GmailClient:
             credentials_path: Path to OAuth2 credentials JSON file
             token_path: Path to store/refresh OAuth2 tokens
         """
-        self.credentials_path = Path(credentials_path)
+        self.credentials_path = Path(credentials_path) if credentials_path else Path("config/credentials.json")
         self.token_path = Path(token_path)
         self.service: Optional[Resource] = None
         self._credentials: Optional[Credentials] = None
         self._flow: Optional[Flow] = None
         self._auth_code: Optional[str] = None
+
+    def _get_client_config(self) -> Dict[str, Any]:
+        """
+        Load OAuth client config from JSON file, or fall back to env vars.
+
+        Supported env vars:
+        - GOOGLE_OAUTH_CLIENT_ID
+        - GOOGLE_OAUTH_CLIENT_SECRET
+        """
+        if self.credentials_path.exists():
+            with open(self.credentials_path, "r") as f:
+                return json.load(f)
+
+        client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+        client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            raise FileNotFoundError(
+                f"Missing Gmail OAuth credentials file at {self.credentials_path} and env vars "
+                f"GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET are not set."
+            )
+
+        # Minimal "installed app" config compatible with google-auth-oauthlib.
+        return {
+            "installed": {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        }
         
     async def initiate_oauth_flow(self, redirect_uri: str = "http://localhost:8080/callback") -> str:
         """
@@ -114,9 +144,10 @@ class GmailClient:
             Authorization URL for user to visit
         """
         try:
+            client_config = self._get_client_config()
             # Create OAuth2 flow
-            self._flow = InstalledAppFlow.from_client_secrets_file(
-                str(self.credentials_path), 
+            self._flow = InstalledAppFlow.from_client_config(
+                client_config,
                 self.SCOPES,
                 redirect_uri=redirect_uri
             )
@@ -437,13 +468,13 @@ class GmailClient:
             parts = payload.get('parts', [])
             for part in parts:
                 attachments.extend(await self._extract_attachments(part))
-        elif part.get('filename') and part.get('body', {}).get('attachmentId'):
+        elif payload.get('filename') and payload.get('body', {}).get('attachmentId'):
             # This is an attachment
             attachment = {
-                'filename': part['filename'],
-                'mime_type': part['mimeType'],
-                'size': part['body'].get('size', 0),
-                'attachment_id': part['body']['attachmentId']
+                'filename': payload['filename'],
+                'mime_type': payload.get('mimeType', ''),
+                'size': payload.get('body', {}).get('size', 0),
+                'attachment_id': payload['body']['attachmentId']
             }
             attachments.append(attachment)
         

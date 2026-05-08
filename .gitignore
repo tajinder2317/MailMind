@@ -132,6 +132,10 @@ dmypy.json
 config/credentials.json
 config/token.json
 config/tokens/
+credentials.json
+token.json
+tokens/
+qdrant_local/
 logs/
 *.log
 

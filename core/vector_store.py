@@ -7,6 +7,7 @@ for semantic search and similarity matching of email threads.
 
 import asyncio
 import logging
+import os
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import uuid
@@ -46,24 +47,62 @@ class VectorStore:
     
     # Collection and vector configuration
     COLLECTION_NAME = "mailmind_threads"
-    VECTOR_SIZE = 1536  # OpenAI text-embedding-3-small dimension
     DISTANCE_METRIC = Distance.COSINE
     
-    # Embedding model
-    EMBEDDING_MODEL = "text-embedding-3-small"
     MAX_BATCH_SIZE = 100
     
-    def __init__(self, qdrant_url: str, qdrant_api_key: str, openai_api_key: str):
+    def __init__(self, qdrant_url: str, qdrant_api_key: str, openai_api_key: Optional[str] = None):
         """
         Initialize vector store.
         
         Args:
             qdrant_url: Qdrant server URL
             qdrant_api_key: Qdrant API key
-            openai_api_key: OpenAI API key for embeddings
+            openai_api_key: OpenAI API key for embeddings (only needed if EMBEDDINGS_PROVIDER=openai)
         """
-        self.client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-        self.openai_client = AsyncOpenAI(api_key=openai_api_key)
+        self.qdrant_url = (qdrant_url or "").strip()
+        self.qdrant_api_key = qdrant_api_key or ""
+        self.client = self._create_client()
+
+        self.embeddings_provider = os.getenv("EMBEDDINGS_PROVIDER", "openai").strip().lower()
+        self.embedding_model: str
+        self.vector_size: int
+        self.openai_client: Optional[AsyncOpenAI] = None
+        self._local_embedder = None
+
+        if self.embeddings_provider in {"local", "fastembed"}:
+            try:
+                from fastembed import TextEmbedding
+            except Exception:  # pragma: no cover
+                # Some fastembed versions locate TextEmbedding elsewhere.
+                from fastembed.embedding import TextEmbedding
+
+            model_name = os.getenv("LOCAL_EMBED_MODEL", "BAAI/bge-small-en-v1.5").strip()
+            self._local_embedder = TextEmbedding(model_name=model_name)
+            probe_vec = next(self._local_embedder.embed(["dimension probe"]))
+            self.vector_size = len(probe_vec)
+            self.embedding_model = model_name
+            logger.info(f"Using local embeddings model={model_name} dim={self.vector_size}")
+        else:
+            if not openai_api_key:
+                raise ValueError("OPENAI_API_KEY is required when EMBEDDINGS_PROVIDER=openai")
+            self.embedding_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
+            self.vector_size = int(os.getenv("OPENAI_EMBED_DIM", "1536"))
+            self.openai_client = AsyncOpenAI(api_key=openai_api_key)
+            logger.info(f"Using OpenAI embeddings model={self.embedding_model} dim={self.vector_size}")
+
+    def _create_client(self) -> QdrantClient:
+        """
+        Create a Qdrant client.
+
+        Supports:
+        - Remote: QDRANT_URL like http://localhost:6333
+        - Embedded/local: QDRANT_URL=local (stores data on disk, no server needed)
+        """
+        if not self.qdrant_url or self.qdrant_url.lower() in {"local", "embedded"}:
+            return QdrantClient(path="qdrant_local")
+
+        return QdrantClient(url=self.qdrant_url, api_key=self.qdrant_api_key)
         
     async def initialize_collection(self) -> bool:
         """
@@ -84,7 +123,7 @@ class VectorStore:
                 self.client.create_collection(
                     collection_name=self.COLLECTION_NAME,
                     vectors_config=VectorParams(
-                        size=self.VECTOR_SIZE,
+                        size=self.vector_size,
                         distance=self.DISTANCE_METRIC
                     )
                 )
@@ -95,17 +134,59 @@ class VectorStore:
                 
                 # Verify collection configuration
                 collection_info = self.client.get_collection(self.COLLECTION_NAME)
-                logger.info(f"Collection info: {collection_info.config.params}")
+                try:
+                    vectors_cfg = collection_info.config.params.vectors
+                    existing_size = getattr(vectors_cfg, "size", None)
+                    if existing_size is None and isinstance(vectors_cfg, dict):
+                        existing_size = vectors_cfg.get("size")
+                except Exception:
+                    existing_size = None
+
+                if existing_size and int(existing_size) != int(self.vector_size):
+                    logger.warning(
+                        f"Collection {self.COLLECTION_NAME} has dim={existing_size} but embedder dim={self.vector_size}; recreating collection"
+                    )
+                    self.client.delete_collection(collection_name=self.COLLECTION_NAME)
+                    self.client.create_collection(
+                        collection_name=self.COLLECTION_NAME,
+                        vectors_config=VectorParams(
+                            size=self.vector_size,
+                            distance=self.DISTANCE_METRIC,
+                        ),
+                    )
+                else:
+                    logger.info(f"Collection info: {collection_info.config.params}")
             
             return True
             
         except Exception as e:
             logger.error(f"Failed to initialize collection: {str(e)}")
-            return False
+
+            # Auto-fallback to embedded/local mode for developer convenience.
+            # This lets the app run without Docker/Qdrant server.
+            try:
+                logger.warning("Falling back to embedded Qdrant (local storage) at qdrant_local/")
+                self.qdrant_url = "local"
+                self.client = self._create_client()
+
+                collections = self.client.get_collections().collections
+                collection_exists = any(col.name == self.COLLECTION_NAME for col in collections)
+                if not collection_exists:
+                    self.client.create_collection(
+                        collection_name=self.COLLECTION_NAME,
+                        vectors_config=VectorParams(
+                            size=self.vector_size,
+                            distance=self.DISTANCE_METRIC
+                        )
+                    )
+                return True
+            except Exception as fallback_error:
+                logger.error(f"Embedded Qdrant fallback failed: {str(fallback_error)}")
+                return False
     
     async def embed_thread(self, thread_content: str) -> List[float]:
         """
-        Generate embedding for thread content using OpenAI.
+        Generate embedding for thread content.
         
         Args:
             thread_content: Thread text to embed
@@ -114,20 +195,24 @@ class VectorStore:
             Embedding vector as list of floats
         """
         try:
-            # Truncate content if too long (OpenAI has token limits)
+            # Truncate content if too long (keeps latency predictable)
             max_chars = 8000  # Conservative estimate
             if len(thread_content) > max_chars:
                 thread_content = thread_content[:max_chars] + "..."
-            
+
+            if self.embeddings_provider in {"local", "fastembed"}:
+                vec = next(self._local_embedder.embed([thread_content]))
+                embedding = vec.tolist() if hasattr(vec, "tolist") else list(vec)
+                return embedding
+
+            if not self.openai_client:
+                raise RuntimeError("OpenAI client not initialized for embeddings")
+
             response = await self.openai_client.embeddings.create(
-                model=self.EMBEDDING_MODEL,
-                input=thread_content
+                model=self.embedding_model,
+                input=thread_content,
             )
-            
-            embedding = response.data[0].embedding
-            logger.info(f"Generated embedding with {len(embedding)} dimensions")
-            
-            return embedding
+            return response.data[0].embedding
             
         except Exception as e:
             logger.error(f"Failed to generate embedding: {str(e)}")
@@ -189,6 +274,10 @@ class VectorStore:
                 "referenced_urls": metadata.get("referenced_urls", []),
                 "referenced_invoices": metadata.get("referenced_invoices", []),
                 "has_attachments": metadata.get("has_attachments", False),
+                # Enhanced intelligence payload (optional)
+                "action_items": metadata.get("action_items", []),
+                "entities": metadata.get("entities", []),
+                "intelligence_metadata": metadata.get("intelligence_metadata", {}),
                 "created_at": datetime.utcnow().isoformat(),
                 "embedded_at": datetime.utcnow().isoformat()
             }
@@ -557,7 +646,7 @@ class VectorStore:
                 "points_count": collection_info.points_count,
                 "status": collection_info.status,
                 "optimizer_status": collection_info.optimizer_status,
-                "vector_size": self.VECTOR_SIZE,
+                "vector_size": self.vector_size,
                 "distance_metric": self.DISTANCE_METRIC.value
             }
             

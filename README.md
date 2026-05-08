@@ -85,11 +85,13 @@ OPENAI_API_KEY=your_openai_api_key_here
 
 # Gmail API Configuration
 GMAIL_CREDENTIALS_PATH=path/to/credentials.json
-GMAIL_TOKEN_PATH=path/to/token.json
+GMAIL_TOKEN_DIR=path/to/tokens
 
 # Database Configuration
 DATABASE_URL=postgresql+asyncpg://user:password@localhost/mailmind
 QDRANT_URL=http://localhost:6333
+# Or run without a Qdrant server (embedded/local storage):
+# QDRANT_URL=local
 QDRANT_API_KEY=your_qdrant_api_key
 
 # Application Settings

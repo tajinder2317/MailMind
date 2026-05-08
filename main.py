@@ -12,11 +12,12 @@ from typing import List, Dict, Any, Optional
 import os
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from urllib.parse import urlparse, parse_qs
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file (override any stale shell exports)
+load_dotenv(override=True)
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -82,6 +83,22 @@ class ThreadResponse(BaseModel):
     detected_tasks: List[str]
     related_threads: List[str]
 
+class ThreadMessageResponse(BaseModel):
+    message_id: str
+    from_email: str
+    to_emails: List[str]
+    cc_emails: List[str] = Field(default_factory=list)
+    body_text: str
+    gmail_date: datetime
+
+
+class ThreadDetailResponse(ThreadResponse):
+    messages: List[ThreadMessageResponse] = Field(default_factory=list)
+    action_items: List[Dict[str, Any]] = Field(default_factory=list)
+    referenced_projects: List[str] = Field(default_factory=list)
+    referenced_urls: List[str] = Field(default_factory=list)
+    referenced_invoices: List[str] = Field(default_factory=list)
+
 
 class HealthResponse(BaseModel):
     status: str
@@ -92,7 +109,11 @@ class HealthResponse(BaseModel):
 # Global application state
 class MailMindState:
     def __init__(self):
-        self.gmail_client: Optional[GmailClient] = None
+        # Gmail state is per-user (use the Gmail address as user_id)
+        self.gmail_clients: Dict[str, GmailClient] = {}
+        self.gmail_oauth_states: Dict[str, str] = {}  # oauth_state -> user_id
+        self.gmail_credentials_path: Optional[str] = None
+        self.gmail_token_dir: Optional[str] = None
         self.attachment_processor: Optional[AttachmentProcessor] = None
         self.sliding_context: Optional[SlidingContextProcessor] = None
         self.action_extractor: Optional[ActionItemExtractor] = None
@@ -125,13 +146,13 @@ async def initialize_components():
         groq_api_key = os.getenv("GROQ_API_KEY")
         openai_api_key = os.getenv("OPENAI_API_KEY")
         gmail_credentials_path = os.getenv("GMAIL_CREDENTIALS_PATH", "credentials.json")
-        gmail_token_path = os.getenv("GMAIL_TOKEN_PATH", "token.json")
+        gmail_token_dir = os.getenv("GMAIL_TOKEN_DIR", "tokens")
         
         if not groq_api_key:
             raise ValueError("GROQ_API_KEY environment variable is required")
-        
-        # Initialize Gmail client
-        state.gmail_client = GmailClient(gmail_credentials_path, gmail_token_path)
+
+        state.gmail_credentials_path = gmail_credentials_path
+        state.gmail_token_dir = gmail_token_dir
         
         # Initialize attachment processor
         state.attachment_processor = AttachmentProcessor()
@@ -162,6 +183,18 @@ async def initialize_components():
         raise
 
 
+def _get_gmail_client_for_user(user_id: str) -> GmailClient:
+    if not state.gmail_credentials_path or not state.gmail_token_dir:
+        raise RuntimeError("Gmail configuration not initialized")
+
+    safe_user_id = user_id.replace("/", "_")
+    token_path = os.path.join(state.gmail_token_dir, f"{safe_user_id}.json")
+
+    if user_id not in state.gmail_clients:
+        state.gmail_clients[user_id] = GmailClient(state.gmail_credentials_path, token_path)
+    return state.gmail_clients[user_id]
+
+
 # Create FastAPI app
 app = FastAPI(
     title="MailMind API",
@@ -190,6 +223,16 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 
 
 # Health check endpoint
+@app.get("/")
+async def root():
+    return {
+        "name": "MailMind API",
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Check application health and component status."""
@@ -197,10 +240,7 @@ async def health_check():
     
     # Check Gmail client
     try:
-        if state.gmail_client:
-            components["gmail"] = "connected" if await state.gmail_client.test_connection() else "disconnected"
-        else:
-            components["gmail"] = "not_initialized"
+        components["gmail"] = "ready" if state.gmail_credentials_path else "not_initialized"
     except:
         components["gmail"] = "error"
     
@@ -220,44 +260,95 @@ async def health_check():
 # Authentication endpoint
 @app.post("/auth/gmail")
 async def authenticate_gmail(request: dict):
-    """Authenticate with Gmail API."""
+    """
+    Start Gmail OAuth for a specific user_id (use your email address as user_id).
+    Returns an authorization URL to open in the browser.
+    """
     try:
         user_id = request.get("user_id")
         if not user_id:
             raise HTTPException(status_code=400, detail="user_id is required")
-            
-        if not state.gmail_client:
-            raise HTTPException(status_code=500, detail="Gmail client not initialized")
-        
-        # For demo purposes, return mock authentication
-        # In production, this would handle OAuth2 flow properly
-        logger.info(f"Mock authentication for user: {user_id}")
-        
-        # Mock successful authentication
+
+        gmail_client = _get_gmail_client_for_user(user_id)
+
+        # Already authenticated? Return profile.
+        if await gmail_client.authenticate():
+            profile = await gmail_client.get_user_profile()
+            return {
+                "status": "authenticated",
+                "user_id": user_id,
+                "user_email": profile["email_address"],
+                "messages_total": profile["messages_total"],
+                "threads_total": profile["threads_total"],
+                "history_id": profile.get("history_id"),
+            }
+
+        redirect_uri = os.getenv("GMAIL_OAUTH_REDIRECT_URI", "http://localhost:8000/auth/gmail/callback")
+        auth_url = await gmail_client.initiate_oauth_flow(redirect_uri=redirect_uri)
+
+        # Keep a server-side mapping so the callback can resolve user_id.
+        oauth_state = parse_qs(urlparse(auth_url).query).get("state", [None])[0]
+        if oauth_state:
+            state.gmail_oauth_states[oauth_state] = user_id
+
         return {
-            "status": "authenticated",
-            "user_email": f"{user_id}@example.com",
-            "messages_total": 1250,
-            "threads_total": 342,
-            "note": "This is mock authentication. In production, implement OAuth2 flow."
+            "status": "authorization_required",
+            "user_id": user_id,
+            "auth_url": auth_url,
+            "redirect_uri": redirect_uri,
         }
-        
-        # Original OAuth2 code (commented out for demo)
-        # success = await state.gmail_client.authenticate()
-        # 
-        # if success:
-        #     profile = await state.gmail_client.get_user_profile()
-        #     return {
-        #         "status": "authenticated",
-        #         "user_email": profile["email_address"],
-        #         "messages_total": profile["messagesTotal"],
-        #         "threads_total": profile["threadsTotal"]
-        #     }
-        # else:
-        #     raise HTTPException(status_code=401, detail="Gmail authentication failed")
             
     except Exception as e:
         logger.error(f"Gmail authentication error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/auth/gmail/callback")
+async def gmail_oauth_callback(code: str, oauth_state: str = Query(alias="state")):
+    """OAuth2 callback endpoint for Gmail authentication."""
+    try:
+        user_id = state.gmail_oauth_states.get(oauth_state)
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Unknown or expired OAuth state. Restart /auth/gmail.")
+
+        gmail_client = _get_gmail_client_for_user(user_id)
+        ok = await gmail_client.complete_oauth_flow(auth_code=code, state=oauth_state)
+        if not ok:
+            raise HTTPException(status_code=401, detail="Gmail OAuth completion failed")
+
+        profile = await gmail_client.get_user_profile()
+        return {
+            "status": "authenticated",
+            "user_id": user_id,
+            "user_email": profile["email_address"],
+            "messages_total": profile["messages_total"],
+            "threads_total": profile["threads_total"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Gmail OAuth callback error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/auth/gmail/status")
+async def gmail_auth_status(user_id: str):
+    """Check whether the given user_id has a valid Gmail token configured."""
+    try:
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+
+        gmail_client = _get_gmail_client_for_user(user_id)
+        authed = await gmail_client.authenticate()
+        if not authed:
+            return {"status": "not_authenticated", "user_id": user_id}
+
+        profile = await gmail_client.get_user_profile()
+        return {"status": "authenticated", "user_id": user_id, "user_email": profile["email_address"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Gmail auth status error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -274,6 +365,11 @@ async def sync_gmail(
         
         if not user_id:
             raise HTTPException(status_code=400, detail="user_id is required")
+
+        gmail_client = _get_gmail_client_for_user(user_id)
+        if not await gmail_client.authenticate():
+            raise HTTPException(status_code=401, detail="Gmail not authenticated. Call POST /auth/gmail first.")
+
         sync_id = f"sync_{user_id}_{datetime.utcnow().timestamp()}"
         
         # Add background task for sync
@@ -302,6 +398,18 @@ async def perform_gmail_sync(sync_id: str, user_id: str, max_threads: int):
     """Background task for Gmail synchronization."""
     try:
         logger.info(f"Starting Gmail sync {sync_id} for user {user_id}")
+
+        gmail_client = _get_gmail_client_for_user(user_id)
+        if not await gmail_client.authenticate():
+            logger.error(f"Gmail sync {sync_id} aborted: user {user_id} not authenticated")
+            return
+
+        # Initialize vector store once for this sync (if embeddings are configured).
+        if (not hasattr(state, "vector_store") or not state.vector_store) and state.openai_api_key:
+            qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+            qdrant_api_key = os.getenv("QDRANT_API_KEY")
+            state.vector_store = VectorStore(qdrant_url, qdrant_api_key or "", state.openai_api_key)
+            await state.vector_store.initialize_collection()
         
         # Get last sync state
         # last_sync = await get_last_sync_state(user_id)
@@ -315,10 +423,10 @@ async def perform_gmail_sync(sync_id: str, user_id: str, max_threads: int):
         attachments_processed = 0
         errors = []
         
-        async for gmail_thread in state.gmail_client.get_threads_since(since_date, max_threads):
+        async for gmail_thread in gmail_client.get_threads_since(since_date, max_threads):
             try:
                 # Process thread
-                thread_result = await process_thread(gmail_thread, user_id)
+                thread_result = await process_thread(gmail_thread, user_id, gmail_client)
                 
                 threads_processed += 1
                 messages_processed += thread_result["messages_processed"]
@@ -338,7 +446,7 @@ async def perform_gmail_sync(sync_id: str, user_id: str, max_threads: int):
         logger.error(f"Gmail sync {sync_id} failed: {str(e)}")
 
 
-async def process_thread(gmail_thread, user_id: str) -> Dict[str, int]:
+async def process_thread(gmail_thread, user_id: str, gmail_client: GmailClient) -> Dict[str, int]:
     """Process a single Gmail thread."""
     messages_processed = len(gmail_thread.messages)
     attachments_processed = 0
@@ -366,7 +474,7 @@ async def process_thread(gmail_thread, user_id: str) -> Dict[str, int]:
         for attachment in msg.attachments:
             try:
                 # Download attachment content
-                content = await state.gmail_client.download_attachment(
+                content = await gmail_client.download_attachment(
                     msg.message_id, 
                     attachment["attachment_id"]
                 )
@@ -399,6 +507,34 @@ async def process_thread(gmail_thread, user_id: str) -> Dict[str, int]:
         context_result["processed_content"],
         messages
     )
+
+    # Store in vector store if available (enables /search).
+    try:
+        if hasattr(state, "vector_store") and state.vector_store:
+            thread_metadata = {
+                "subject": gmail_thread.subject,
+                "participant_emails": gmail_thread.participant_emails,
+                "message_count": len(messages),
+                "first_message_date": messages[0]["gmail_date"].isoformat() if messages else None,
+                "last_message_date": messages[-1]["gmail_date"].isoformat() if messages else None,
+                "has_attachments": attachments_processed > 0,
+                "action_items": action_items,
+                "referenced_projects": references.get("projects", []),
+                "referenced_urls": references.get("urls", []),
+                "referenced_invoices": references.get("invoices", []),
+                "intelligence_metadata": {
+                    "has_tasks": bool(action_items),
+                    "has_entities": bool(references.get("projects") or references.get("invoices") or references.get("urls")),
+                },
+            }
+            await state.vector_store.store_thread(
+                thread_id=gmail_thread.thread_id,
+                user_id=user_id,
+                thread_content=context_result["processed_content"],
+                metadata=thread_metadata,
+            )
+    except Exception as e:
+        logger.warning(f"Failed to store thread {gmail_thread.thread_id} in vector store: {str(e)}")
     
     # Store in database (simplified for demo)
     # await store_thread_in_db(thread_data, context_result, action_items, references)
@@ -411,13 +547,13 @@ async def process_thread(gmail_thread, user_id: str) -> Dict[str, int]:
 
 # Search endpoints
 @app.post("/search", response_model=SearchResponse)
-async def search_threads(request: dict):
+async def search_threads(request: SearchRequest):
     """Search threads using intelligent semantic similarity with self-correction."""
     try:
-        user_id = request.get("user_id")
-        query = request.get("query")
-        limit = request.get("limit", 10)
-        filters = request.get("filters")
+        user_id = request.user_id
+        query = request.query
+        limit = request.limit
+        filters = request.filters
         
         if not user_id or not query:
             raise HTTPException(status_code=400, detail="user_id and query are required")
@@ -427,16 +563,18 @@ async def search_threads(request: dict):
         if not hasattr(state, 'vector_store') or not state.vector_store:
             qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
             qdrant_api_key = os.getenv("QDRANT_API_KEY")
-            
-            # Use OpenAI API key for embeddings (Groq doesn't provide embeddings)
-            if not state.openai_api_key:
-                raise HTTPException(status_code=500, detail="OpenAI API key not configured for embeddings")
-            
+
+            # Embeddings provider is selected inside VectorStore (OpenAI or local/fastembed).
             state.vector_store = VectorStore(qdrant_url, qdrant_api_key or "", state.openai_api_key)
-            await state.vector_store.initialize_collection()
+            ok = await state.vector_store.initialize_collection()
+            if not ok:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Vector store unavailable. Ensure Qdrant is running and QDRANT_URL is correct (e.g. http://localhost:6333).",
+                )
         
         # Detect query intent for self-correction
-        query_intent = await _detect_query_intent(request.query)
+        query_intent = await _detect_query_intent(query)
         logger.info(f"Detected query intent: {query_intent}")
         
         # Perform intelligent search based on intent
@@ -492,23 +630,23 @@ async def _detect_query_intent(query: str) -> str:
 async def _search_tasks(request: SearchRequest, user_id: str, intent: str) -> List[Dict[str, Any]]:
     """Search for threads with action items, prioritizing task metadata."""
     try:
-        # First, search for threads with action items using metadata filtering
-        results = await state.vector_store.client.search(
+        # Qdrant `search()` requires a query vector; for metadata-only queries use `scroll()`.
+        points, _next_offset = state.vector_store.client.scroll(
             collection_name="mailmind_threads",
-            query_filter={
+            scroll_filter={
                 "must": [
                     {"key": "user_id", "match": {"value": user_id}},
-                    {"key": "intelligence_metadata.has_tasks", "match": {"value": True}}
+                    {"key": "intelligence_metadata.has_tasks", "match": {"value": True}},
                 ]
             },
             limit=request.limit,
-            with_payload=True
+            with_payload=True,
         )
         
         # Convert to response format
         formatted_results = []
-        for hit in results:
-            payload = hit.payload
+        for point in points:
+            payload = point.payload or {}
             action_items = payload.get("action_items", [])
             
             # Filter action items based on query
@@ -522,7 +660,7 @@ async def _search_tasks(request: SearchRequest, user_id: str, intent: str) -> Li
                 formatted_results.append({
                     "thread_id": payload["thread_id"],
                     "subject": payload["subject"],
-                    "score": hit.score,
+                    "score": None,
                     "snippet": _extract_task_snippet(relevant_tasks or action_items),
                     "participants": payload["participant_emails"],
                     "date": payload["last_message_date"],
@@ -531,15 +669,11 @@ async def _search_tasks(request: SearchRequest, user_id: str, intent: str) -> Li
                     "search_type": "task_search"
                 })
         
-        # If no results from task search, fallback to semantic search
-        if not formatted_results:
-            return await _search_semantic(request, user_id)
-        
         return formatted_results
         
     except Exception as e:
         logger.error(f"Task search failed: {str(e)}")
-        return await _search_semantic(request, user_id)
+        return []
 
 
 async def _search_entities(request: SearchRequest, user_id: str, intent: str) -> List[Dict[str, Any]]:
@@ -548,37 +682,23 @@ async def _search_entities(request: SearchRequest, user_id: str, intent: str) ->
         # Extract potential entity values from query
         entity_values = _extract_entity_values(request.query)
         
+        must_conditions = [{"key": "user_id", "match": {"value": user_id}}]
         if entity_values:
-            # Search for threads containing these entities
-            results = await state.vector_store.client.search(
-                collection_name="mailmind_threads",
-                query_filter={
-                    "must": [
-                        {"key": "user_id", "match": {"value": user_id}},
-                        {"key": "entities.entity_value", "match": {"any": entity_values}}
-                    ]
-                },
-                limit=request.limit,
-                with_payload=True
-            )
+            must_conditions.append({"key": "entities.entity_value", "match": {"any": entity_values}})
         else:
-            # Search for threads with any entities
-            results = await state.vector_store.client.search(
-                collection_name="mailmind_threads",
-                query_filter={
-                    "must": [
-                        {"key": "user_id", "match": {"value": user_id}},
-                        {"key": "intelligence_metadata.has_entities", "match": {"value": True}}
-                    ]
-                },
-                limit=request.limit,
-                with_payload=True
-            )
+            must_conditions.append({"key": "intelligence_metadata.has_entities", "match": {"value": True}})
+
+        points, _next_offset = state.vector_store.client.scroll(
+            collection_name="mailmind_threads",
+            scroll_filter={"must": must_conditions},
+            limit=request.limit,
+            with_payload=True,
+        )
         
         # Convert to response format
         formatted_results = []
-        for hit in results:
-            payload = hit.payload
+        for point in points:
+            payload = point.payload or {}
             entities = payload.get("entities", [])
             
             # Filter entities based on query
@@ -594,7 +714,7 @@ async def _search_entities(request: SearchRequest, user_id: str, intent: str) ->
             formatted_results.append({
                 "thread_id": payload["thread_id"],
                 "subject": payload["subject"],
-                "score": hit.score,
+                "score": None,
                 "snippet": _extract_entity_snippet(relevant_entities or entities),
                 "participants": payload["participant_emails"],
                 "date": payload["last_message_date"],
@@ -607,7 +727,7 @@ async def _search_entities(request: SearchRequest, user_id: str, intent: str) ->
         
     except Exception as e:
         logger.error(f"Entity search failed: {str(e)}")
-        return await _search_semantic(request, user_id)
+        return []
 
 
 async def _search_semantic(request: SearchRequest, user_id: str) -> List[Dict[str, Any]]:
@@ -773,56 +893,80 @@ async def generate_draft_reply(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/threads/{thread_id}", response_model=ThreadResponse)
+@app.get("/threads/{thread_id}", response_model=ThreadDetailResponse)
 async def get_thread(thread_id: str, user_id: str):
     """Get detailed thread information."""
     try:
         if not user_id:
             raise HTTPException(status_code=400, detail="user_id is required")
-        # Retrieve thread from database (to be implemented)
-        # thread_data = await get_thread_from_db(thread_id, user_id)
-        
-        # Mock thread data for demo
+        gmail_client = _get_gmail_client_for_user(user_id)
+        if not await gmail_client.authenticate():
+            raise HTTPException(status_code=401, detail="Gmail not authenticated. Call POST /auth/gmail first.")
+
+        gmail_thread = await gmail_client.get_thread(thread_id)
+        messages_sorted = sorted(gmail_thread.messages, key=lambda m: m.gmail_date)
+
+        first_date = messages_sorted[0].gmail_date if messages_sorted else datetime.utcnow()
+        last_date = messages_sorted[-1].gmail_date if messages_sorted else first_date
+
+        aggregated_content = "\n\n".join([m.body_text for m in messages_sorted if m.body_text])
+
+        # Best-effort enrichment from vector store (if indexed)
+        action_items: List[Dict[str, Any]] = []
+        referenced_projects: List[str] = []
+        referenced_urls: List[str] = []
+        referenced_invoices: List[str] = []
+
+        if hasattr(state, "vector_store") and state.vector_store:
+            try:
+                points, _ = state.vector_store.client.scroll(
+                    collection_name=VectorStore.COLLECTION_NAME,
+                    scroll_filter={
+                        "must": [
+                            {"key": "user_id", "match": {"value": user_id}},
+                            {"key": "thread_id", "match": {"value": thread_id}},
+                        ]
+                    },
+                    limit=1,
+                    with_payload=True,
+                )
+                if points:
+                    payload = points[0].payload or {}
+                    action_items = payload.get("action_items", []) or []
+                    referenced_projects = payload.get("referenced_projects", []) or []
+                    referenced_urls = payload.get("referenced_urls", []) or []
+                    referenced_invoices = payload.get("referenced_invoices", []) or []
+            except Exception as e:
+                logger.debug(f"Vector enrichment failed for thread {thread_id}: {str(e)}")
+
         thread_data = {
             "thread_id": thread_id,
-            "subject": "Project Update - Q1 Planning",
-            "message_count": 5,
-            "participant_emails": ["alice@example.com", "bob@example.com"],
-            "first_message_date": "2024-01-15T10:30:00Z",
-            "last_message_date": "2024-01-15T14:30:00Z",
-            "has_attachments": True,
-            "detected_tasks": ["Complete quarterly report", "Schedule team meeting"],
-            "aggregated_content": "Discussion about Q1 planning and resource allocation...",
+            "subject": gmail_thread.subject or "No Subject",
+            "message_count": len(messages_sorted),
+            "participant_emails": gmail_thread.participant_emails,
+            "first_message_date": first_date,
+            "last_message_date": last_date,
+            "aggregated_content": aggregated_content,
+            "detected_tasks": [t.get("task_text") for t in action_items if isinstance(t, dict) and t.get("task_text")],
+            "related_threads": [],
             "messages": [
                 {
-                    "message_id": "msg_1",
-                    "from_email": "alice@example.com",
-                    "to_emails": ["bob@example.com"],
-                    "subject": "Project Update - Q1 Planning",
-                    "body_text": "Let's discuss our Q1 planning...",
-                    "gmail_date": "2024-01-15T10:30:00Z"
+                    "message_id": m.message_id,
+                    "from_email": m.from_email,
+                    "to_emails": m.to_emails,
+                    "cc_emails": m.cc_emails,
+                    "body_text": m.body_text,
+                    "gmail_date": m.gmail_date,
                 }
+                for m in messages_sorted
             ],
-            "action_items": [
-                {
-                    "task_text": "Complete quarterly report",
-                    "priority": "high",
-                    "assignee": "bob@example.com",
-                    "due_date": "2024-01-20",
-                    "status": "pending"
-                }
-            ],
-            "entities": [
-                {
-                    "entity_type": "project",
-                    "entity_value": "Q1-Planning",
-                    "confidence_score": 0.9
-                }
-            ],
-            "related_threads": ["thread_456", "thread_789"]
+            "action_items": action_items,
+            "referenced_projects": referenced_projects,
+            "referenced_urls": referenced_urls,
+            "referenced_invoices": referenced_invoices,
         }
-        
-        return ThreadResponse(**thread_data)
+
+        return ThreadDetailResponse(**thread_data)
         
     except Exception as e:
         logger.error(f"Get thread error: {str(e)}")
@@ -1010,22 +1154,30 @@ async def list_threads(user_id: str, limit: int = 20, offset: int = 0, sort_by: 
     try:
         if not user_id:
             raise HTTPException(status_code=400, detail="user_id is required")
-        
-        # Get threads from database (to be implemented)
-        # threads = await list_user_threads(user_id, limit, offset, sort_by)
-        
-        # Mock threads for demo
-        threads = [
-            {
-                "thread_id": "thread_123",
-                "subject": "Project Update - Q1 Planning",
-                "message_count": 5,
-                "participant_emails": ["alice@example.com", "bob@example.com"],
-                "last_message_date": datetime.utcnow() - timedelta(days=1),
-                "has_attachments": True,
-                "detected_tasks": 2
-            }
-        ]
+
+        gmail_client = _get_gmail_client_for_user(user_id)
+        if not await gmail_client.authenticate():
+            raise HTTPException(status_code=401, detail="Gmail not authenticated. Call POST /auth/gmail first.")
+
+        thread_ids, _next_page = await gmail_client.get_threads(max_results=limit)
+        threads = []
+        for thread_id in thread_ids:
+            try:
+                th = await gmail_client.get_thread(thread_id)
+                messages_sorted = sorted(th.messages, key=lambda m: m.gmail_date)
+                last_date = messages_sorted[-1].gmail_date if messages_sorted else datetime.utcnow()
+                threads.append(
+                    {
+                        "thread_id": th.thread_id,
+                        "subject": th.subject or "No Subject",
+                        "message_count": len(messages_sorted),
+                        "participant_emails": th.participant_emails,
+                        "last_message_date": last_date,
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Failed to fetch thread {thread_id}: {str(e)}")
+                continue
         
         return {
             "threads": threads,

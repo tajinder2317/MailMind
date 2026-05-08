@@ -10,6 +10,7 @@ import asyncio
 import logging
 from typing import List, Dict, Any, Optional
 from openai import OpenAI, AsyncOpenAI
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +29,11 @@ class GroqClient:
         if not self.api_key:
             raise ValueError("GROQ_API_KEY environment variable is required")
         
-        self.base_url = "https://groq.com"
-        self.model = os.getenv("LLM_MODEL", "llama3-70b-8192")
+        # Groq provides an OpenAI-compatible API surface.
+        # See: https://console.groq.com/ (API base typically ends with /openai/v1)
+        self.base_url = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+        # Default to a currently supported Groq model id.
+        self.model = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
         
         # Rate limiting configuration
         self.call_delay = float(os.getenv("LLM_CALL_DELAY", "2.0"))
@@ -71,6 +75,7 @@ class GroqClient:
     async def chat_completion(
         self,
         messages: List[Dict[str, str]],
+        model: Optional[str] = None,
         max_tokens: Optional[int] = None,
         temperature: float = 0.3,
         **kwargs
@@ -95,7 +100,7 @@ class GroqClient:
                     logger.debug(f"Groq API call attempt {attempt + 1}/{self.max_retries + 1}")
                     
                     response = await self.async_client.chat.completions.create(
-                        model=self.model,
+                        model=model or self.model,
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
@@ -107,6 +112,20 @@ class GroqClient:
                     
                 except Exception as e:
                     logger.warning(f"Groq API call attempt {attempt + 1} failed: {str(e)}")
+
+                    # If Groq returns a rate limit error with a retry-after hint, honor it.
+                    try:
+                        status_code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+                        message = str(e)
+                        if status_code == 429 or "rate limit" in message.lower():
+                            match = re.search(r"try again in ([0-9]+(?:\\.[0-9]+)?)s", message, re.IGNORECASE)
+                            if match:
+                                wait_s = float(match.group(1)) + 0.5
+                                logger.info(f"Groq rate limited; sleeping {wait_s:.1f}s before retry")
+                                await asyncio.sleep(wait_s)
+                                continue
+                    except Exception:
+                        pass
                     
                     if attempt < self.max_retries:
                         # Exponential backoff for retries
@@ -163,6 +182,7 @@ class GroqClient:
     def sync_chat_completion(
         self,
         messages: List[Dict[str, str]],
+        model: Optional[str] = None,
         max_tokens: Optional[int] = None,
         temperature: float = 0.3,
         **kwargs
@@ -195,7 +215,7 @@ class GroqClient:
                 logger.debug(f"Groq API sync call attempt {attempt + 1}/{self.max_retries + 1}")
                 
                 response = self.client.chat.completions.create(
-                    model=self.model,
+                    model=model or self.model,
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
