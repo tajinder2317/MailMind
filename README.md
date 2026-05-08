@@ -7,13 +7,13 @@ A sophisticated Python-based RAG (Retrieval-Augmented Generation) system that in
 ### Core Architecture
 - **Thread-Centric Indexing**: Groups messages by thread_id, sorts chronologically, and concatenates body text for comprehensive context
 - **Attachment Pipeline**: Extracts text from PDF, DOCX, and images (PNG/JPG) using OCR
-- **Sliding Context**: Uses GPT-4o-mini to generate running summaries for threads exceeding 4000 tokens
-- **State Management**: PostgreSQL tracks last_synced_at and message_id to prevent duplicate processing
+- **Sliding Context (Optional)**: Summarizes long threads via Groq (can be disabled for free-tier rate limits)
+- **State Management (Planned)**: PostgreSQL models exist, but sync state persistence is not fully wired yet
 
 ### Advanced Features
 - **Action-Item Extraction**: Detects and stores tasks, commitments, and deadlines during embedding phase
 - **Cross-Thread Relationships**: Links threads based on shared project codes, invoice numbers, and URLs
-- **Semantic Search**: OpenAI embeddings with Qdrant for intelligent thread retrieval
+- **Semantic Search**: Local embeddings (FastEmbed) + embedded Qdrant by default (no paid APIs required)
 - **RESTful API**: FastAPI endpoints for sync, search, and management operations
 
 ## 🏗️ Architecture
@@ -36,20 +36,20 @@ MailMind/
 
 ## 🛠️ Tech Stack
 
-- **Framework**: FastAPI + LangChain
-- **Database**: PostgreSQL (SQLAlchemy) + Qdrant (Vector)
+- **Framework**: FastAPI
+- **Vector Store**: Qdrant (embedded/local by default, server optional)
+- **Database (Planned)**: PostgreSQL (SQLAlchemy models included)
 - **Auth**: Google OAuth2 (Gmail API)
-- **AI**: OpenAI GPT-4o-mini + text-embedding-3-small
+- **AI (LLM)**: Groq (OpenAI-compatible API) for summaries/action items/draft replies
+- **Embeddings**: Local embeddings via `fastembed` (default), OpenAI optional
 - **Processing**: AsyncIO background tasks
 - **OCR**: Tesseract/EasyOCR for images
 
 ## 📋 Prerequisites
 
-- Python 3.9+
-- PostgreSQL 13+
-- Qdrant server
-- OpenAI API key
-- Gmail API credentials
+- Python 3.11+
+- Groq API key
+- Gmail API credentials (OAuth)
 - Tesseract OCR (for image processing)
 
 ## 🚀 Quick Start
@@ -77,26 +77,33 @@ brew install tesseract
 
 ### 2. Environment Setup
 
-Create `.env` file:
+Create `.env` file (never commit it):
 
 ```bash
-# OpenAI Configuration
-OPENAI_API_KEY=your_openai_api_key_here
+# Groq Configuration
+GROQ_API_KEY=your_groq_api_key_here
+LLM_MODEL=llama-3.3-70b-versatile
 
 # Gmail API Configuration
-GMAIL_CREDENTIALS_PATH=path/to/credentials.json
-GMAIL_TOKEN_DIR=path/to/tokens
+GMAIL_CREDENTIALS_PATH=config/credentials.json
+GMAIL_TOKEN_DIR=tokens
 
-# Database Configuration
-DATABASE_URL=postgresql+asyncpg://user:password@localhost/mailmind
-QDRANT_URL=http://localhost:6333
-# Or run without a Qdrant server (embedded/local storage):
-# QDRANT_URL=local
-QDRANT_API_KEY=your_qdrant_api_key
+# Optional alternative: use env-based OAuth (instead of credentials.json)
+GOOGLE_OAUTH_CLIENT_ID=your_client_id.apps.googleusercontent.com
+GOOGLE_OAUTH_CLIENT_SECRET=your_client_secret
+
+# Vector store (default: embedded/local)
+QDRANT_URL=local
+EMBEDDINGS_PROVIDER=local
+LOCAL_EMBED_MODEL=BAAI/bge-small-en-v1.5
 
 # Application Settings
 LOG_LEVEL=INFO
 MAX_WORKERS=10
+
+# To reduce Groq usage on free tier during sync:
+ENABLE_LLM_ACTION_EXTRACTION=false
+ENABLE_SLIDING_CONTEXT_SUMMARY=false
 ```
 
 ### 3. Gmail API Setup
@@ -104,37 +111,24 @@ MAX_WORKERS=10
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
 2. Create a new project or select existing
 3. Enable Gmail API
-4. Create OAuth2 credentials (Desktop Application)
-5. Download credentials JSON and save as `credentials.json`
+4. Create OAuth2 credentials (Web Application recommended for callback flow)
+5. Add redirect URI: `http://localhost:8000/auth/gmail/callback`
+6. Download credentials JSON and save as `config/credentials.json`
 
-### 4. Database Setup
-
-```bash
-# Create PostgreSQL database
-createdb mailmind
-
-# Run migrations (when implemented)
-alembic upgrade head
-```
-
-### 5. Start Qdrant
-
-```bash
-# Using Docker
-docker run -p 6333:6333 qdrant/qdrant
-
-# Or download and run locally
-# https://qdrant.tech/documentation/install/
-```
-
-### 6. Run Application
+### 4. Run Application
 
 ```bash
 # Development server
 python main.py
 
-# Or using uvicorn directly
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# Stable (no auto-reload)
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+### 5. Run Frontend (Streamlit)
+
+```bash
+streamlit run frontend/app.py
 ```
 
 ## 📚 API Documentation
@@ -202,8 +196,8 @@ GET /threads?limit=20&offset=0&sort_by=last_message_date
 ### Thread Processing
 
 - **Token Limit**: 4000 tokens before sliding context activation
-- **Summary Model**: GPT-4o-mini
-- **Embedding Model**: text-embedding-3-small
+- **Summary Model**: Groq model via `SUMMARY_MODEL` / `LLM_MODEL`
+- **Embedding Model**: local via `LOCAL_EMBED_MODEL` (default)
 - **Max Messages per Thread**: No limit (chronological processing)
 
 ### Attachment Processing
@@ -263,10 +257,10 @@ curl http://localhost:8000/vector/stats
 ## 🔒 Security
 
 - OAuth2 for Gmail authentication
-- JWT tokens for API security
 - Environment-based configuration
 - Input validation and sanitization
-- Rate limiting (Gmail API quotas)
+- Rate limiting (Gmail API quotas + Groq free-tier)
+- Never commit `.env`, OAuth credentials, or token files
 
 ## 🚀 Deployment
 

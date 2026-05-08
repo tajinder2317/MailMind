@@ -70,7 +70,7 @@ A sophisticated Streamlit-based web interface for the MailMind email intelligenc
 |----------|---------|-------------|
 | `API_BASE_URL` | `http://localhost:8000` | Backend API URL |
 | `FRONTEND_PORT` | `8501` | Frontend port |
-| `USER_ID` | `demo_user` | Default user ID |
+| `USER_ID` | `your_email@gmail.com` | Default user ID |
 | `CACHE_TTL` | `300` | Cache duration in seconds |
 | `MAX_GRAPH_NODES` | `50` | Maximum nodes in thread map |
 | `DEFAULT_SEARCH_LIMIT` | `10` | Default search result limit |
@@ -79,9 +79,8 @@ A sophisticated Streamlit-based web interface for the MailMind email intelligenc
 
 The frontend requires the MailMind backend API to be running:
 - FastAPI server on port 8000
-- Qdrant vector database
-- PostgreSQL database
-- OpenAI API integration
+- Qdrant vector database (embedded/local by default; no separate service needed for local dev)
+- OpenAI is optional (local embeddings are supported)
 
 ## Usage
 
@@ -97,10 +96,10 @@ The frontend requires the MailMind backend API to be running:
    - Monitor progress in the sidebar
    - Wait for completion notification
 
-3. **Explore Your Intelligence:**
+3. **Explore Your Emails:**
    - Check the Summary View for top action items
    - Use the Search tab to find specific information
-   - View the Thread Map to see relationships
+   - Open "Thread Detail" to read full thread messages
 
 ### Search Examples
 
@@ -151,6 +150,8 @@ The frontend communicates with the backend through REST endpoints:
 - `GET /tasks` - Top action items
 - `POST /sync/gmail` - Start sync
 - `GET /sync/status/{id}` - Sync progress
+
+Note: some endpoints like `/tasks` and `/sync/status/{id}` may still return demo data while the database layer is being finalized.
 
 ### Data Flow
 

@@ -49,9 +49,6 @@
    # Install dependencies
    pip install -r requirements.txt
    
-   # Start databases with Docker
-   docker-compose up db qdrant -d
-   
    # Configure environment
    cp .env.example .env
    # Edit .env with your configuration
@@ -83,7 +80,7 @@
 
 ### Environment Variables
 
-Create `.env` file in root directory:
+Create `.env` file in root directory (never commit it):
 
 ```bash
 # Groq Configuration (High-speed LLM)
@@ -94,15 +91,20 @@ LLM_MODEL=llama-3.3-70b-versatile
 DATABASE_URL=postgresql+asyncpg://mailmind:your_password@localhost:5432/mailmind
 POSTGRES_PASSWORD=your_secure_password
 
-# Qdrant Configuration
-QDRANT_URL=http://localhost:6333
-QDRANT_API_KEY=your_qdrant_api_key
+# Qdrant + embeddings (default: embedded/local, no server needed)
+QDRANT_URL=local
+EMBEDDINGS_PROVIDER=local
+LOCAL_EMBED_MODEL=BAAI/bge-small-en-v1.5
 
 # Application Configuration
 LOG_LEVEL=INFO
 MAX_WORKERS=10
 DEBUG_MODE=false
 USER_ID=soorma2317@gmail.com
+
+# Reduce Groq usage on free tier during sync
+ENABLE_LLM_ACTION_EXTRACTION=false
+ENABLE_SLIDING_CONTEXT_SUMMARY=false
 
 # Frontend Configuration (for frontend/.env)
 API_BASE_URL=http://localhost:8000
@@ -114,12 +116,12 @@ FRONTEND_PORT=8501
 1. **Google Cloud Console**
    - Create new project or use existing
    - Enable Gmail API
-   - Create OAuth 2.0 credentials (Web Application)
+   - Create OAuth 2.0 credentials (Web Application recommended)
    - Add redirect URI: `http://localhost:8000/auth/gmail/callback`
 
 2. **Download Credentials**
    - Download JSON credentials file
-   - Save as `config/credentials.json`
+   - Save as `config/credentials.json` (gitignored)
 
 3. **Test Authentication**
    - Start the backend application
@@ -145,6 +147,13 @@ docker-compose up qdrant -d
 
 # Check connection
 curl http://localhost:6333/health
+```
+
+#### Qdrant (Local/Embedded - Recommended for dev)
+No service needed. Set:
+```bash
+QDRANT_URL=local
+EMBEDDINGS_PROVIDER=local
 ```
 
 ## 🗂️ Project Structure
@@ -202,7 +211,7 @@ docker-compose down -v
 
 ```bash
 # Backend
-python main.py
+uvicorn main:app --host 0.0.0.0 --port 8000
 
 # Frontend
 streamlit run frontend/app.py
@@ -276,17 +285,14 @@ docker-compose up db -d
 ls -la config/credentials.json
 
 # Clear tokens and re-authenticate
-rm config/token.json
+rm -rf tokens/
 ```
 
 **Groq API Issues**
 ```bash
-# Test API key
-curl -H "Authorization: Bearer $GROQ_API_KEY" \
-     https://groq.com/api/v1/models
-
 # Check environment variables
 echo $GROQ_API_KEY
+echo $LLM_MODEL
 ```
 
 **Frontend Not Loading**
