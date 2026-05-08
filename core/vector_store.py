@@ -73,7 +73,7 @@ class VectorStore:
         if self.embeddings_provider in {"local", "fastembed"}:
             try:
                 from fastembed import TextEmbedding
-            except Exception:  # pragma: no cover
+            except ImportError:  # pragma: no cover
                 # Some fastembed versions locate TextEmbedding elsewhere.
                 from fastembed.embedding import TextEmbedding
 

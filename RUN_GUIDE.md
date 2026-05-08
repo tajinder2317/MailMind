@@ -73,7 +73,7 @@
    
    # Terminal 2: Frontend
    cd frontend
-   streamlit run app.py
+   streamlit run frontend/app.py
    ```
 
 ## 🔧 Detailed Configuration
@@ -218,6 +218,9 @@ streamlit run frontend/app.py
 
 # With custom port
 streamlit run frontend/app.py --server.port 8502
+
+Tip: there is also a repo-root Streamlit entrypoint for convenience:
+`streamlit run streamlit_app.py`
 ```
 
 ## 🔍 Testing the Setup

@@ -17,6 +17,15 @@ from urllib.parse import urlparse, parse_qs
 # Load environment variables from .env file (override any stale shell exports)
 load_dotenv(override=True)
 
+# Silence noisy deprecation warnings emitted via loguru when some dependencies
+# import `fastembed` (e.g. qdrant-client).
+try:  # pragma: no cover
+    from loguru import logger as _loguru_logger
+
+    _loguru_logger.disable("fastembed")
+except Exception:  # pragma: no cover
+    pass
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -1194,11 +1203,12 @@ async def list_threads(user_id: str, limit: int = 20, offset: int = 0, sort_by: 
 # Development server
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    
+
+    port = int(os.getenv("PORT", "8000"))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         reload=True,
         log_level="info"
     )

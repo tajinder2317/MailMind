@@ -129,6 +129,9 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ```bash
 streamlit run frontend/app.py
+
+# Or, from the repo root:
+streamlit run streamlit_app.py
 ```
 
 ## 📚 API Documentation

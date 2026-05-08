@@ -1,9 +1,11 @@
 # MailMind Requirements
 
 # Core Framework
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-pydantic==2.5.0
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]>=0.30.0,<1.0.0
+pydantic>=2.7.0,<3.0.0
+starlette>=0.40.0,<1.0.0
+anyio>=4.0.0,<5.0.0
 
 # Database
 sqlalchemy==2.0.23
@@ -40,7 +42,7 @@ aiohttp==3.9.1
 aiofiles==23.2.1
 
 # Utilities
-python-multipart==0.0.6
+python-multipart>=0.0.10,<1.0.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-dotenv==1.0.0

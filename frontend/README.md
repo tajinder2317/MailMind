@@ -176,6 +176,9 @@ Note: some endpoints like `/tasks` and `/sync/status/{id}` may still return demo
 # Run locally
 streamlit run app.py
 
+From the repo root you can also run:
+`streamlit run streamlit_app.py`
+
 # Test with Docker
 docker build -t mailmind-frontend .
 docker run -p 8501:8501 mailmind-frontend
