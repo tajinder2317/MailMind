@@ -161,6 +161,19 @@ class MailMindAPI:
         except requests.RequestException as e:
             st.error(f"Thread error: {str(e)}")
             return {}
+
+    def list_threads(self, user_id: str, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
+        """List recent threads (inbox-style)."""
+        try:
+            response = self.session.get(
+                f"{self.base_url}/threads",
+                params={"user_id": user_id, "limit": limit, "offset": offset},
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            st.error(f"List threads error: {str(e)}")
+            return {"threads": [], "total": 0, "limit": limit, "offset": offset}
     
     def generate_draft_reply(
         self,
@@ -216,6 +229,32 @@ class MailMindAPI:
             st.error(f"Sync status error: {str(e)}")
             return {}
 
+    def assistant_chat(
+        self,
+        user_id: str,
+        thread_id: str,
+        message: str,
+        conversation: Optional[List[Dict[str, str]]] = None,
+        instructions: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Chat with AI about a specific thread."""
+        try:
+            response = self.session.post(
+                f"{self.base_url}/assistant/chat",
+                json={
+                    "user_id": user_id,
+                    "thread_id": thread_id,
+                    "message": message,
+                    "instructions": instructions,
+                    "conversation": conversation or [],
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            st.error(f"Assistant chat error: {str(e)}")
+            return {"answer": "", "suggested_actions": []}
+
 
 # Initialize API client
 api = MailMindAPI()
@@ -231,6 +270,12 @@ if 'sync_in_progress' not in st.session_state:
     st.session_state.sync_in_progress = False
 if 'sync_id' not in st.session_state:
     st.session_state.sync_id = None
+if "inbox_offset" not in st.session_state:
+    st.session_state.inbox_offset = 0
+if "assistant_messages" not in st.session_state:
+    st.session_state.assistant_messages = []  # [{role: user|assistant, content: str}]
+if "assistant_instructions" not in st.session_state:
+    st.session_state.assistant_instructions = "You help me search and operate on emails. Be direct and propose next actions."
 
 
 def render_header():
@@ -438,6 +483,142 @@ def render_contextual_search():
                 render_thread_card(result, i)
         else:
             st.info("No results found. Try a different search query.")
+
+
+def render_inbox():
+    """Render inbox-style thread list with lightweight filters."""
+    st.header("📥 Inbox")
+
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        filter_text = st.text_input("Filter (subject/participants)", placeholder="e.g. invoice, hiring, jira")
+    with col2:
+        page_size = st.selectbox("Page size", options=[10, 20, 50], index=1)
+    with col3:
+        refresh = st.button("↻ Refresh", use_container_width=True)
+
+    if refresh:
+        st.session_state.inbox_offset = 0
+
+    with st.spinner("Loading threads..."):
+        data = api.list_threads(
+            st.session_state.user_id,
+            limit=int(page_size),
+            offset=int(st.session_state.inbox_offset),
+        )
+
+    threads = data.get("threads", []) or []
+    if filter_text:
+        ft = filter_text.lower().strip()
+
+        def _match(t: Dict[str, Any]) -> bool:
+            subj = (t.get("subject") or "").lower()
+            parts = " ".join(t.get("participant_emails") or []).lower()
+            return ft in subj or ft in parts
+
+        threads = [t for t in threads if _match(t)]
+
+    if not threads:
+        st.info("No threads to show. Authenticate + Sync, then try again.")
+        return
+
+    for i, th in enumerate(threads):
+        thread_id = th.get("thread_id")
+        subject = th.get("subject") or "No Subject"
+        participants = th.get("participant_emails") or []
+        last_date = th.get("last_message_date") or ""
+        message_count = th.get("message_count", 0)
+
+        st.markdown('<div class="thread-card">', unsafe_allow_html=True)
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.markdown(f"### {subject}")
+            st.markdown(
+                f"**{message_count} msgs** • {', '.join(participants[:3])}{'…' if len(participants) > 3 else ''} • **{last_date}**"
+            )
+        with c2:
+            if st.button("📖 Open", key=f"inbox_open_{st.session_state.inbox_offset}_{i}", use_container_width=True):
+                st.session_state.selected_thread = thread_id
+                st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_assistant():
+    """Render AI assistant chat for the selected thread."""
+    st.header("🤖 Assistant")
+
+    thread_id = st.session_state.get("selected_thread")
+    if not thread_id:
+        thread_id = st.text_input("Thread ID", placeholder="Open a thread from Inbox/Search, or paste a thread id here")
+        if thread_id:
+            st.session_state.selected_thread = thread_id
+
+    if not st.session_state.get("selected_thread"):
+        st.info("Select a thread first (Inbox/Search) to chat with it.")
+        return
+
+    st.session_state.assistant_instructions = st.text_area(
+        "Assistant prompt / instructions",
+        value=st.session_state.assistant_instructions,
+        height=90,
+        help="This controls how the assistant behaves (tone, format, what operations to propose).",
+    )
+
+    def _send(prompt: str):
+        st.session_state.assistant_messages.append({"role": "user", "content": prompt})
+        with st.spinner("Thinking..."):
+            resp = api.assistant_chat(
+                user_id=st.session_state.user_id,
+                thread_id=st.session_state.selected_thread,
+                message=prompt,
+                conversation=st.session_state.assistant_messages[-12:],
+                instructions=st.session_state.assistant_instructions,
+            )
+        answer = (resp.get("answer") or "").strip()
+        if answer:
+            st.session_state.assistant_messages.append({"role": "assistant", "content": answer})
+        else:
+            st.session_state.assistant_messages.append({"role": "assistant", "content": "I couldn't generate a response. Check API logs."})
+        st.rerun()
+
+    # Quick prompts
+    qp1, qp2, qp3, qp4 = st.columns(4)
+    with qp1:
+        if st.button("Summarize", use_container_width=True):
+            _send("Summarize this thread in 5 bullets and highlight next actions.")
+    with qp2:
+        if st.button("Action items", use_container_width=True):
+            _send("Extract action items from this thread. For each: owner, due date (if any), and urgency.")
+    with qp3:
+        if st.button("Draft reply", use_container_width=True):
+            _send("Draft a professional reply to the latest email. Keep it concise and ask clarifying questions if needed.")
+    with qp4:
+        if st.button("Clear chat", use_container_width=True):
+            st.session_state.assistant_messages = []
+            st.rerun()
+
+    # Conversation view
+    for m in st.session_state.assistant_messages:
+        role = m.get("role", "assistant")
+        content = m.get("content", "")
+        with st.chat_message(role):
+            st.markdown(content)
+
+    # Input
+    user_message = st.chat_input("Ask about this thread or request an operation (e.g., 'reply', 'schedule', 'follow up').")
+    if not user_message:
+        return
+    _send(user_message)
+
+    col_prev, col_next, _ = st.columns([1, 1, 6])
+    with col_prev:
+        if st.button("← Prev", disabled=st.session_state.inbox_offset <= 0):
+            st.session_state.inbox_offset = max(0, st.session_state.inbox_offset - int(page_size))
+            st.rerun()
+    with col_next:
+        if st.button("Next →", disabled=len(data.get("threads", []) or []) < int(page_size)):
+            st.session_state.inbox_offset = st.session_state.inbox_offset + int(page_size)
+            st.rerun()
 
 
 def render_thread_card(result: Dict[str, Any], index: int):
@@ -902,7 +1083,17 @@ def render_thread_detail():
             msg_date = msg.get("gmail_date", "")
             body_text = msg.get("body_text", "") or ""
             with st.expander(f"{from_email} — {msg_date}", expanded=False):
-                st.text(body_text)
+                st.markdown(body_text if body_text.strip() else "*No body text*")
+
+        with st.expander("📎 Thread tools"):
+            if st.button("Copy aggregated content", key="copy_thread_agg"):
+                st.session_state["thread_agg_copy"] = thread_data.get("aggregated_content", "")
+                st.success("Copied to session. You can paste from the text box below.")
+            st.text_area(
+                "Aggregated content",
+                value=st.session_state.get("thread_agg_copy", thread_data.get("aggregated_content", "")),
+                height=200,
+            )
     
     # Related threads
     if thread_data.get("related_threads"):
@@ -924,19 +1115,22 @@ def main():
     render_sidebar()
     
     # Navigation tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 Summary", "🔍 Search", "🕸️ Thread Map", "📧 Thread Detail"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📥 Inbox", "🔍 Search", "📧 Thread", "🤖 Assistant", "📋 Summary"])
     
     with tab1:
-        render_summary_view()
+        render_inbox()
     
     with tab2:
         render_contextual_search()
     
     with tab3:
-        render_thread_map()
+        render_thread_detail()
     
     with tab4:
-        render_thread_detail()
+        render_assistant()
+
+    with tab5:
+        render_summary_view()
 
 
 if __name__ == "__main__":

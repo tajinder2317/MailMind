@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import os
+import json
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from urllib.parse import urlparse, parse_qs
@@ -42,6 +43,7 @@ from core.relationship_mapper import RelationshipMapper
 from core.embedding_pipeline import EmbeddingPipeline, ExtractedTask, ExtractedEntity
 from core.vector_store import VectorStore
 from core.draft_reply_agent import DraftReplyAgent, ThreadContext, UserWritingStyle, ReplyType
+from core.groq_client import get_async_groq_client
 
 # Database and vector store imports (to be implemented)
 # from database import get_db, engine
@@ -113,6 +115,19 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     components: Dict[str, str]
+
+
+class AssistantChatRequest(BaseModel):
+    user_id: str
+    thread_id: str
+    message: str
+    instructions: Optional[str] = Field(default=None, description="Extra assistant instructions/prompt.")
+    conversation: List[Dict[str, str]] = Field(default_factory=list, description="Prior conversation messages (role/content).")
+
+
+class AssistantChatResponse(BaseModel):
+    answer: str
+    suggested_actions: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # Global application state
@@ -190,6 +205,23 @@ async def initialize_components():
     except Exception as e:
         logger.error(f"Failed to initialize components: {str(e)}")
         raise
+
+
+async def _ensure_vector_store() -> VectorStore:
+    """Initialize vector store once and return it."""
+    if hasattr(state, "vector_store") and state.vector_store:
+        return state.vector_store
+
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_api_key = os.getenv("QDRANT_API_KEY")
+    state.vector_store = VectorStore(qdrant_url, qdrant_api_key or "", state.openai_api_key)
+    ok = await state.vector_store.initialize_collection()
+    if not ok:
+        raise HTTPException(
+            status_code=503,
+            detail="Vector store unavailable. Ensure Qdrant is running and QDRANT_URL is correct (e.g. http://localhost:6333).",
+        )
+    return state.vector_store
 
 
 def _get_gmail_client_for_user(user_id: str) -> GmailClient:
@@ -517,31 +549,31 @@ async def process_thread(gmail_thread, user_id: str, gmail_client: GmailClient) 
         messages
     )
 
-    # Store in vector store if available (enables /search).
+    # Store in vector store (enables /search).
     try:
-        if hasattr(state, "vector_store") and state.vector_store:
-            thread_metadata = {
-                "subject": gmail_thread.subject,
-                "participant_emails": gmail_thread.participant_emails,
-                "message_count": len(messages),
-                "first_message_date": messages[0]["gmail_date"].isoformat() if messages else None,
-                "last_message_date": messages[-1]["gmail_date"].isoformat() if messages else None,
-                "has_attachments": attachments_processed > 0,
-                "action_items": action_items,
-                "referenced_projects": references.get("projects", []),
-                "referenced_urls": references.get("urls", []),
-                "referenced_invoices": references.get("invoices", []),
-                "intelligence_metadata": {
-                    "has_tasks": bool(action_items),
-                    "has_entities": bool(references.get("projects") or references.get("invoices") or references.get("urls")),
-                },
-            }
-            await state.vector_store.store_thread(
-                thread_id=gmail_thread.thread_id,
-                user_id=user_id,
-                thread_content=context_result["processed_content"],
-                metadata=thread_metadata,
-            )
+        vector_store = await _ensure_vector_store()
+        thread_metadata = {
+            "subject": gmail_thread.subject,
+            "participant_emails": gmail_thread.participant_emails,
+            "message_count": len(messages),
+            "first_message_date": messages[0]["gmail_date"].isoformat() if messages else None,
+            "last_message_date": messages[-1]["gmail_date"].isoformat() if messages else None,
+            "has_attachments": attachments_processed > 0,
+            "action_items": action_items,
+            "referenced_projects": references.get("projects", []),
+            "referenced_urls": references.get("urls", []),
+            "referenced_invoices": references.get("invoices", []),
+            "intelligence_metadata": {
+                "has_tasks": bool(action_items),
+                "has_entities": bool(references.get("projects") or references.get("invoices") or references.get("urls")),
+            },
+        }
+        await vector_store.store_thread(
+            thread_id=gmail_thread.thread_id,
+            user_id=user_id,
+            thread_content=context_result["processed_content"],
+            metadata=thread_metadata,
+        )
     except Exception as e:
         logger.warning(f"Failed to store thread {gmail_thread.thread_id} in vector store: {str(e)}")
     
@@ -568,19 +600,7 @@ async def search_threads(request: SearchRequest):
             raise HTTPException(status_code=400, detail="user_id and query are required")
         start_time = datetime.utcnow()
         
-        # Initialize vector store if not available
-        if not hasattr(state, 'vector_store') or not state.vector_store:
-            qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
-            qdrant_api_key = os.getenv("QDRANT_API_KEY")
-
-            # Embeddings provider is selected inside VectorStore (OpenAI or local/fastembed).
-            state.vector_store = VectorStore(qdrant_url, qdrant_api_key or "", state.openai_api_key)
-            ok = await state.vector_store.initialize_collection()
-            if not ok:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Vector store unavailable. Ensure Qdrant is running and QDRANT_URL is correct (e.g. http://localhost:6333).",
-                )
+        await _ensure_vector_store()
         
         # Detect query intent for self-correction
         query_intent = await _detect_query_intent(query)
@@ -979,6 +999,124 @@ async def get_thread(thread_id: str, user_id: str):
         
     except Exception as e:
         logger.error(f"Get thread error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assistant/chat", response_model=AssistantChatResponse)
+async def assistant_chat(payload: AssistantChatRequest):
+    """Chat with an AI assistant grounded in a specific Gmail thread."""
+    try:
+        if not payload.user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        if not payload.thread_id:
+            raise HTTPException(status_code=400, detail="thread_id is required")
+        if not payload.message:
+            raise HTTPException(status_code=400, detail="message is required")
+
+        gmail_client = _get_gmail_client_for_user(payload.user_id)
+        if not await gmail_client.authenticate():
+            raise HTTPException(status_code=401, detail="Gmail not authenticated. Call POST /auth/gmail first.")
+
+        gmail_thread = await gmail_client.get_thread(payload.thread_id)
+        messages_sorted = sorted(gmail_thread.messages, key=lambda m: m.gmail_date)
+
+        # Build a compact context block (avoid huge payloads)
+        context_messages = []
+        for m in messages_sorted[-10:]:
+            body = (m.body_text or "").strip()
+            if len(body) > 4000:
+                body = body[:4000] + "…"
+            context_messages.append(
+                f"From: {m.from_email}\nDate: {m.gmail_date}\nBody:\n{body}"
+            )
+
+        enrichment = {"action_items": [], "referenced_projects": [], "referenced_urls": [], "referenced_invoices": []}
+        if hasattr(state, "vector_store") and state.vector_store:
+            try:
+                points, _ = state.vector_store.client.scroll(
+                    collection_name=VectorStore.COLLECTION_NAME,
+                    scroll_filter={
+                        "must": [
+                            {"key": "user_id", "match": {"value": payload.user_id}},
+                            {"key": "thread_id", "match": {"value": payload.thread_id}},
+                        ]
+                    },
+                    limit=1,
+                    with_payload=True,
+                )
+                if points:
+                    p = points[0].payload or {}
+                    enrichment["action_items"] = p.get("action_items", []) or []
+                    enrichment["referenced_projects"] = p.get("referenced_projects", []) or []
+                    enrichment["referenced_urls"] = p.get("referenced_urls", []) or []
+                    enrichment["referenced_invoices"] = p.get("referenced_invoices", []) or []
+            except Exception as e:
+                logger.debug(f"Assistant enrichment failed for thread {payload.thread_id}: {str(e)}")
+
+        context_block = (
+            f"THREAD SUBJECT: {gmail_thread.subject or 'No Subject'}\n"
+            f"PARTICIPANTS: {', '.join(gmail_thread.participant_emails)}\n\n"
+            f"KNOWN ACTION ITEMS (may be empty): {json.dumps(enrichment['action_items'])}\n"
+            f"REFERENCED PROJECTS: {json.dumps(enrichment['referenced_projects'])}\n"
+            f"REFERENCED URLS: {json.dumps(enrichment['referenced_urls'])}\n"
+            f"REFERENCED INVOICES: {json.dumps(enrichment['referenced_invoices'])}\n\n"
+            f"LATEST MESSAGES:\n\n" + "\n\n---\n\n".join(context_messages)
+        )
+
+        extra_instructions = (payload.instructions or "").strip()
+        system_prompt = (
+            "You are MailMind, an assistant for understanding and operating on a Gmail thread.\n"
+            "Rules:\n"
+            "- Ground answers in the provided thread context.\n"
+            "- If the user asks to do an operation (reply/follow-up/summarize/extract tasks), explain what to do and provide the content.\n"
+            "- You cannot actually send email or modify Gmail state unless an explicit API exists; be honest.\n"
+            "- Keep responses concise and actionable.\n"
+        )
+        if extra_instructions:
+            system_prompt = system_prompt + "\nExtra instructions from the user:\n" + extra_instructions + "\n"
+
+        # Normalize conversation (role/content only)
+        convo = []
+        for m in payload.conversation[-20:]:
+            role = (m.get("role") or "").strip()
+            content = (m.get("content") or "").strip()
+            if role in {"user", "assistant"} and content:
+                convo.append({"role": role, "content": content})
+
+        # Avoid duplicating the last user message if the client already included it
+        if not (convo and convo[-1]["role"] == "user" and convo[-1]["content"] == payload.message.strip()):
+            convo.append({"role": "user", "content": payload.message.strip()})
+
+        llm = await get_async_groq_client()
+        llm_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"THREAD CONTEXT (read-only):\n\n{context_block}"},
+            *convo,
+        ]
+
+        response = await llm.chat_completion(llm_messages, temperature=0.2, max_tokens=800)
+        answer = ""
+        try:
+            answer = (response.choices[0].message.content or "").strip()
+        except Exception:
+            answer = ""
+
+        # Heuristic suggestions for UI buttons
+        msg_lower = payload.message.lower()
+        suggested_actions: List[Dict[str, Any]] = []
+        if any(k in msg_lower for k in ["draft", "reply", "respond"]):
+            suggested_actions.append({"action": "draft_reply", "label": "Generate draft reply"})
+        if any(k in msg_lower for k in ["action item", "todo", "task"]):
+            suggested_actions.append({"action": "extract_tasks", "label": "Extract action items"})
+        if any(k in msg_lower for k in ["summarize", "summary"]):
+            suggested_actions.append({"action": "summarize", "label": "Summarize thread"})
+
+        return AssistantChatResponse(answer=answer, suggested_actions=suggested_actions)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Assistant chat error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
